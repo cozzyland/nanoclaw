@@ -246,7 +246,7 @@ function formatTranscriptMarkdown(messages: ParsedMessage[], title?: string | nu
   lines.push('');
 
   for (const msg of messages) {
-    const sender = msg.role === 'user' ? 'User' : 'Andy';
+    const sender = msg.role === 'user' ? 'User' : (process.env.ASSISTANT_NAME || 'Andy');
     const content = msg.content.length > 2000
       ? msg.content.slice(0, 2000) + '...'
       : msg.content;
@@ -387,9 +387,14 @@ async function runQuery(
     log(`Additional directories: ${extraDirs.join(', ')}`);
   }
 
-  for await (const message of query({
-    prompt: stream,
-    options: {
+  log(`About to start SDK query with prompt stream...`);
+  let loopEntered = false;
+  let queryGenerator;
+
+  try {
+    queryGenerator = query({
+      prompt: stream,  // Use MessageStream for multi-turn support
+      options: {
       cwd: '/workspace/group',
       additionalDirectories: extraDirs.length > 0 ? extraDirs : undefined,
       resume: sessionId,
@@ -425,7 +430,15 @@ async function runQuery(
         PreCompact: [{ hooks: [createPreCompactHook()] }]
       },
     }
-  })) {
+  });
+
+    log(`Query generator created successfully, starting iteration...`);
+
+    for await (const message of queryGenerator) {
+    if (!loopEntered) {
+      log(`Entered SDK query loop - first message received`);
+      loopEntered = true;
+    }
     messageCount++;
     const msgType = message.type === 'system' ? `system/${(message as { subtype?: string }).subtype}` : message.type;
     log(`[msg #${messageCount}] type=${msgType}`);
@@ -455,6 +468,12 @@ async function runQuery(
       });
     }
   }
+    log(`Exited SDK query loop normally. Loop was ${loopEntered ? '' : 'NOT '}entered.`);
+  } catch (queryError) {
+    log(`SDK query error: ${queryError instanceof Error ? queryError.message : String(queryError)}`);
+    log(`Stack: ${queryError instanceof Error ? queryError.stack : 'no stack'}`);
+    throw queryError;
+  }
 
   ipcPolling = false;
   log(`Query done. Messages: ${messageCount}, results: ${resultCount}, lastAssistantUuid: ${lastAssistantUuid || 'none'}, closedDuringQuery: ${closedDuringQuery}`);
@@ -463,6 +482,11 @@ async function runQuery(
 
 async function main(): Promise<void> {
   let containerInput: ContainerInput;
+
+  // Check if API key is set
+  const apiKeySet = !!process.env.ANTHROPIC_API_KEY;
+  const apiKeyLength = process.env.ANTHROPIC_API_KEY?.length || 0;
+  log(`ANTHROPIC_API_KEY env var: ${apiKeySet ? `SET (length: ${apiKeyLength})` : 'NOT SET'}`);
 
   try {
     const stdinData = await readStdin();
@@ -488,6 +512,7 @@ async function main(): Promise<void> {
 
   // Build initial prompt (drain any pending IPC messages too)
   let prompt = containerInput.prompt;
+  log(`Initial prompt length: ${prompt?.length || 0}, content preview: ${prompt?.slice(0, 200) || '(empty)'}`);
   if (containerInput.isScheduledTask) {
     prompt = `[SCHEDULED TASK - The following message was sent automatically and is not coming directly from the user or group.]\n\n${prompt}`;
   }
@@ -496,9 +521,11 @@ async function main(): Promise<void> {
     log(`Draining ${pending.length} pending IPC messages into initial prompt`);
     prompt += '\n' + pending.join('\n');
   }
+  log(`Final prompt before query - length: ${prompt?.length || 0}`);
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);

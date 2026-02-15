@@ -1,0 +1,11 @@
+# This directory is for the main group's persistent data
+
+# Files tracked in git:
+# - CLAUDE.md (group instructions)
+# - COOKIE_EXPORT_GUIDE.md (user guide)
+# - GROCERY_ORDERING_SETUP.md (quick start)
+
+# Files NOT tracked (in .gitignore):
+# - *-cookies.json (authentication tokens)
+# - .agent-browser/ (browser profiles)
+# - conversations/ (message history)

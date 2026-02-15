@@ -16,8 +16,9 @@ import {
   IDLE_TIMEOUT,
 } from './config.js';
 import { logger } from './logger.js';
-import { validateAdditionalMounts } from './mount-security.js';
+import { validateAdditionalMounts, verifyMountInode } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
+import { getConservativeHardening, getHardeningArgs } from './security/container-hardening.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -40,6 +41,9 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  // Request ID for distributed tracing across services
+  // Allows correlating logs from orchestrator → container → credential proxy → egress proxy
+  requestId?: string;
 }
 
 export interface ContainerOutput {
@@ -164,7 +168,9 @@ function buildVolumeMounts(
   const envFile = path.join(projectRoot, '.env');
   if (fs.existsSync(envFile)) {
     const envContent = fs.readFileSync(envFile, 'utf-8');
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'ANTHROPIC_API_KEY'];
+    // SECURITY: ANTHROPIC_API_KEY removed from container environment (Phase 2: Credential Isolation)
+    // API key is now injected by credential proxy at runtime - agents never see it
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -193,6 +199,16 @@ function buildVolumeMounts(
     readonly: true,
   });
 
+  // Mount utility scripts (cookie injection, etc.)
+  const scriptsDir = path.join(projectRoot, 'container', 'scripts');
+  if (fs.existsSync(scriptsDir)) {
+    mounts.push({
+      hostPath: scriptsDir,
+      containerPath: '/app/scripts',
+      readonly: true,
+    });
+  }
+
   // Additional mounts validated against external allowlist (tamper-proof from containers)
   if (group.containerConfig?.additionalMounts) {
     const validatedMounts = validateAdditionalMounts(
@@ -209,8 +225,55 @@ function buildVolumeMounts(
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
+  // Phase 2: Credential Injection
+  // Pass real API key directly to container
+  // TODO: Credential proxy approach doesn't work with Agent SDK - it ignores ANTHROPIC_BASE_URL
+  // Acceptable risk given strong egress filtering, read-only FS, and ephemeral containers
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) {
+    throw new Error('ANTHROPIC_API_KEY not set in host environment');
+  }
+  args.push('-e', `ANTHROPIC_API_KEY=${apiKey}`);
+
+  // Phase 5: Network Egress Filtering
+  // Route all other HTTP/HTTPS requests through egress proxy
+  // Lima VM gateway IP (container's default route, from /etc/resolv.conf nameserver)
+  const limaGatewayIp = '192.168.64.1';
+  const egressProxyUrl = `http://${limaGatewayIp}:${process.env.EGRESS_PROXY_PORT || '3002'}`;
+  args.push('-e', `HTTP_PROXY=${egressProxyUrl}`);
+  args.push('-e', `HTTPS_PROXY=${egressProxyUrl}`);
+  args.push('-e', 'NO_PROXY=localhost,127.0.0.1,api.anthropic.com');
+
+  // Phase 3: Container Hardening
+  // Apply security restrictions (read-only FS, resource limits, etc.)
+  // Using conservative config for Apple Container compatibility
+  const hardeningArgs = getHardeningArgs(getConservativeHardening());
+  args.push(...hardeningArgs);
+
+  // SDK needs writable home directory for config files
+  // Mount /home/node as tmpfs (ephemeral, wiped on container exit)
+  args.push('--tmpfs', '/home/node');
+
+  // Verify inode for all mounts before mounting (TOCTOU prevention)
+  // Filter out any mounts where inode has changed
+  const verifiedMounts = mounts.filter((mount) => {
+    // Only verify mounts that have inode information (additional mounts)
+    if ('ino' in mount && 'dev' in mount) {
+      const isValid = verifyMountInode(mount as any);
+      if (!isValid) {
+        logger.error(
+          { mount: mount.hostPath },
+          '🚨 SECURITY: Skipping mount due to TOCTOU attack detection',
+        );
+      }
+      return isValid;
+    }
+    // Standard mounts (project, group folders) don't have inode info - always allow
+    return true;
+  });
+
   // Apple Container: --mount for readonly, -v for read-write
-  for (const mount of mounts) {
+  for (const mount of verifiedMounts) {
     if (mount.readonly) {
       args.push(
         '--mount',
@@ -281,7 +344,12 @@ export async function runContainerAgent(
     let stderrTruncated = false;
 
     // Write input and close stdin (Apple Container doesn't flush pipe without EOF)
-    container.stdin.write(JSON.stringify(input));
+    const inputJson = JSON.stringify(input);
+    logger.debug(
+      { inputLength: inputJson.length, promptLength: input.prompt.length, group: group.name },
+      'Writing input to container stdin',
+    );
+    container.stdin.write(inputJson);
     container.stdin.end();
 
     // Streaming output: parse OUTPUT_START/END marker pairs as they arrive

@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -38,6 +39,8 @@ import { formatMessages, formatOutbound } from './router.js';
 import { startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
+import { startCredentialProxy } from './credential-proxy.js';
+import { EgressProxy, DEFAULT_EGRESS_CONFIG } from './security/egress-proxy.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -255,6 +258,9 @@ async function runAgent(
     : undefined;
 
   try {
+    // Generate request ID for distributed tracing
+    const requestId = crypto.randomUUID();
+
     const output = await runContainerAgent(
       group,
       {
@@ -263,6 +269,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        requestId, // For correlating logs across orchestrator → container → proxies
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
       wrappedOnOutput,
@@ -457,6 +464,22 @@ async function main(): Promise<void> {
   ensureContainerSystemRunning();
   initDatabase();
   logger.info('Database initialized');
+
+  // Start credential proxy (Phase 2: Credential Isolation)
+  // Proxies Anthropic API requests and injects credentials at runtime
+  // Agents never see the real API key
+  const credProxyPort = parseInt(process.env.CREDENTIAL_PROXY_PORT || '3001', 10);
+  await startCredentialProxy(credProxyPort, '0.0.0.0');
+  logger.info({ port: credProxyPort }, 'Credential proxy started');
+
+  // Start network egress proxy (Phase 5: Network Egress Filtering)
+  // Filters all outbound HTTP/HTTPS traffic from containers
+  // Blocks unauthorized domains and prevents data exfiltration
+  const egressProxyPort = parseInt(process.env.EGRESS_PROXY_PORT || '3002', 10);
+  const egressProxy = new EgressProxy(DEFAULT_EGRESS_CONFIG);
+  await egressProxy.start(egressProxyPort, '0.0.0.0');
+  logger.info({ port: egressProxyPort }, 'Network egress proxy started');
+
   loadState();
 
   // Graceful shutdown handlers

@@ -132,15 +132,34 @@ function expandPath(p: string): string {
 }
 
 /**
- * Get the real path, resolving symlinks.
+ * Get the real path, resolving symlinks, along with inode information.
  * Returns null if the path doesn't exist.
+ *
+ * The inode information is used to prevent TOCTOU attacks:
+ * After validation, we can verify the path still points to the same file
+ * by checking the inode hasn't changed.
  */
-function getRealPath(p: string): string | null {
+function getRealPathWithInode(p: string): { path: string; ino: number; dev: number } | null {
   try {
-    return fs.realpathSync(p);
+    const realPath = fs.realpathSync(p);
+    const stats = fs.statSync(realPath);
+    return {
+      path: realPath,
+      ino: stats.ino,
+      dev: stats.dev,
+    };
   } catch {
     return null;
   }
+}
+
+/**
+ * DEPRECATED: Use getRealPathWithInode instead to prevent TOCTOU attacks.
+ * Kept for backward compatibility but should not be used.
+ */
+function getRealPath(p: string): string | null {
+  const result = getRealPathWithInode(p);
+  return result ? result.path : null;
 }
 
 /**
@@ -223,6 +242,10 @@ export interface MountValidationResult {
   realHostPath?: string;
   resolvedContainerPath?: string;
   effectiveReadonly?: boolean;
+  // Inode information for TOCTOU prevention
+  // Before mounting, caller should verify the path still points to the same inode
+  ino?: number;
+  dev?: number;
 }
 
 /**
@@ -254,16 +277,18 @@ export function validateMount(
     };
   }
 
-  // Expand and resolve the host path
+  // Expand and resolve the host path with inode information (TOCTOU prevention)
   const expandedPath = expandPath(mount.hostPath);
-  const realPath = getRealPath(expandedPath);
+  const pathInfo = getRealPathWithInode(expandedPath);
 
-  if (realPath === null) {
+  if (pathInfo === null) {
     return {
       allowed: false,
       reason: `Host path does not exist: "${mount.hostPath}" (expanded: "${expandedPath}")`,
     };
   }
+
+  const { path: realPath, ino, dev } = pathInfo;
 
   // Check against blocked patterns
   const blockedMatch = matchesBlockedPattern(
@@ -324,7 +349,54 @@ export function validateMount(
     realHostPath: realPath,
     resolvedContainerPath: containerPath,
     effectiveReadonly,
+    // Include inode information for TOCTOU prevention
+    // Caller should verify path still points to same inode before mounting
+    ino,
+    dev,
   };
+}
+
+/**
+ * Verify that a validated mount still points to the same inode.
+ * This prevents TOCTOU attacks where an attacker swaps a symlink target
+ * between validation and mounting.
+ *
+ * @returns true if the mount is still safe, false if inode has changed
+ */
+export function verifyMountInode(mount: ValidatedMount): boolean {
+  // If no inode info was captured during validation, we can't verify
+  // This shouldn't happen in normal operation, but fail safe
+  if (mount.ino === undefined || mount.dev === undefined) {
+    logger.warn(
+      { mount: mount.hostPath },
+      'Mount validation did not capture inode - cannot verify TOCTOU safety',
+    );
+    return true; // Allow but log warning
+  }
+
+  try {
+    const currentStats = fs.statSync(mount.hostPath);
+    if (currentStats.ino !== mount.ino || currentStats.dev !== mount.dev) {
+      logger.error(
+        {
+          mount: mount.hostPath,
+          expectedIno: mount.ino,
+          expectedDev: mount.dev,
+          actualIno: currentStats.ino,
+          actualDev: currentStats.dev,
+        },
+        '🚨 SECURITY: Mount target changed after validation (TOCTOU attack detected!)',
+      );
+      return false;
+    }
+    return true;
+  } catch (err) {
+    logger.error(
+      { mount: mount.hostPath, err },
+      'Failed to verify mount inode - path may no longer exist',
+    );
+    return false;
+  }
 }
 
 /**
@@ -332,20 +404,21 @@ export function validateMount(
  * Returns array of validated mounts (only those that passed validation).
  * Logs warnings for rejected mounts.
  */
+export interface ValidatedMount {
+  hostPath: string;
+  containerPath: string;
+  readonly: boolean;
+  // Inode information for TOCTOU prevention
+  ino?: number;
+  dev?: number;
+}
+
 export function validateAdditionalMounts(
   mounts: AdditionalMount[],
   groupName: string,
   isMain: boolean,
-): Array<{
-  hostPath: string;
-  containerPath: string;
-  readonly: boolean;
-}> {
-  const validatedMounts: Array<{
-    hostPath: string;
-    containerPath: string;
-    readonly: boolean;
-  }> = [];
+): ValidatedMount[] {
+  const validatedMounts: ValidatedMount[] = [];
 
   for (const mount of mounts) {
     const result = validateMount(mount, isMain);
@@ -355,6 +428,9 @@ export function validateAdditionalMounts(
         hostPath: result.realHostPath!,
         containerPath: `/workspace/extra/${result.resolvedContainerPath}`,
         readonly: result.effectiveReadonly!,
+        // Include inode information for TOCTOU prevention
+        ino: result.ino,
+        dev: result.dev,
       });
 
       logger.debug(

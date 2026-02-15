@@ -17,6 +17,16 @@ groups/main/*
 groups/global/*
 !groups/main/CLAUDE.md
 !groups/global/CLAUDE.md
+!groups/main/COOKIE_EXPORT_GUIDE.md
+!groups/main/GROCERY_ORDERING_SETUP.md
+!groups/main/.gitkeep
+
+# Cookie files (contain authentication tokens)
+*-cookies.json
+.state-*.json
+
+# Agent browser profiles (may contain session data)
+.agent-browser/
 
 # Secrets
 *.keys.json

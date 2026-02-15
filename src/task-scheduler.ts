@@ -1,5 +1,6 @@
 import { ChildProcess } from 'child_process';
 import { CronExpressionParser } from 'cron-parser';
+import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
@@ -102,6 +103,9 @@ async function runTask(
   };
 
   try {
+    // Generate request ID for distributed tracing
+    const requestId = crypto.randomUUID();
+
     const output = await runContainerAgent(
       group,
       {
@@ -111,6 +115,7 @@ async function runTask(
         chatJid: task.chat_jid,
         isMain,
         isScheduledTask: true,
+        requestId, // For correlating logs across orchestrator → container → proxies
       },
       (proc, containerName) => deps.onProcess(task.chat_jid, proc, containerName, task.group_folder),
       async (streamedOutput: ContainerOutput) => {

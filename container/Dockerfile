@@ -50,6 +50,10 @@ RUN npm run build
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
+# Copy security hardening files (Phase 3: Container Hardening)
+RUN mkdir -p /etc/security
+COPY security/seccomp-profile.json /etc/security/seccomp-profile.json
+
 # Create entrypoint script
 # Sources env from mounted /workspace/env-dir/env if it exists (workaround for Apple Container -i bug)
 # Stdin is buffered to /tmp then piped (Apple Container requires EOF to flush stdin pipe)
