@@ -19,6 +19,7 @@ groups/global/*
 !groups/global/CLAUDE.md
 !groups/main/COOKIE_EXPORT_GUIDE.md
 !groups/main/GROCERY_ORDERING_SETUP.md
+!groups/main/user-profile.md
 !groups/main/.gitkeep
 
 # Cookie files (contain authentication tokens)
