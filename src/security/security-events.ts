@@ -52,13 +52,26 @@ class SecurityEventLogger {
   constructor(logFilePath?: string) {
     this.logFilePath = logFilePath;
 
-    // Load existing events from file if it exists
+    // Ensure log directory exists
+    if (logFilePath) {
+      const dir = path.dirname(logFilePath);
+      if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true });
+      }
+    }
+
+    // Load only recent events from file (last 30 days) to avoid unbounded memory usage
     if (logFilePath && fs.existsSync(logFilePath)) {
       try {
         const data = fs.readFileSync(logFilePath, 'utf-8');
         const lines = data.trim().split('\n').filter(Boolean);
-        this.events = lines.map(line => JSON.parse(line));
-        logger.info({ count: this.events.length }, 'Loaded existing security events');
+        const cutoff = Date.now() - (30 * 24 * 60 * 60 * 1000);
+        this.events = lines
+          .map(line => { try { return JSON.parse(line); } catch { return null; } })
+          .filter((e): e is SecurityEvent =>
+            e !== null && new Date(e.timestamp).getTime() > cutoff
+          );
+        logger.info({ loaded: this.events.length, total: lines.length }, 'Loaded recent security events');
       } catch (err) {
         logger.error({ err }, 'Failed to load existing security events');
       }
@@ -264,9 +277,14 @@ class SecurityEventLogger {
   }
 }
 
-// Singleton instance
+// Singleton instance — log stored outside project root to prevent container tampering
+// Falls back to ~/Library/Logs/nanoclaw/ on macOS, ./data/ only if env var overrides
+const defaultLogPath = process.platform === 'darwin'
+  ? path.join(process.env.HOME || '/tmp', 'Library', 'Logs', 'nanoclaw', 'security-events.log')
+  : './data/security-events.log';
+
 export const securityEvents = new SecurityEventLogger(
-  process.env.SECURITY_LOG_FILE || './data/security-events.log'
+  process.env.SECURITY_LOG_FILE || defaultLogPath
 );
 
 /**

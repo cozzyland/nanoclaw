@@ -168,8 +168,18 @@ export class EgressProxy {
   }
 
   private setupRoutes() {
-    // Health check
-    this.app.get('/_health', (req, res) => {
+    // Restrict management endpoints to localhost only (containers connect via gateway IP)
+    const localhostOnly = (req: Request, res: Response, next: () => void) => {
+      const ip = req.ip || req.socket.remoteAddress || '';
+      if (ip === '127.0.0.1' || ip === '::1' || ip === '::ffff:127.0.0.1') {
+        next();
+      } else {
+        res.sendStatus(403);
+      }
+    };
+
+    // Health check (localhost only)
+    this.app.get('/_health', localhostOnly, (req, res) => {
       res.json({
         status: 'healthy',
         allowedDomains: this.config.allowedDomains.length,
@@ -177,8 +187,8 @@ export class EgressProxy {
       });
     });
 
-    // Audit log endpoint
-    this.app.get('/_audit', (req, res) => {
+    // Audit log endpoint (localhost only)
+    this.app.get('/_audit', localhostOnly, (req, res) => {
       const limit = parseInt(req.query.limit as string) || 100;
       res.json({
         recent: auditLog.slice(-limit),
@@ -417,18 +427,19 @@ export const DEFAULT_EGRESS_CONFIG: EgressProxyConfig = {
     'api.anthropic.com',
     '*.anthropic.com',
 
-    // GitHub (for npm packages, docs, etc.)
+    // GitHub (specific subdomains only — no *.github.com wildcard)
     'github.com',
-    '*.github.com',
+    'api.github.com',
     'raw.githubusercontent.com',
+    'objects.githubusercontent.com',
+    'codeload.github.com',
 
     // NPM registry
     'registry.npmjs.org',
-    '*.npmjs.org',
 
     // Python package index
     'pypi.org',
-    '*.pypi.org',
+    'files.pythonhosted.org',
 
     // Documentation sites
     'docs.npmjs.com',
@@ -444,22 +455,23 @@ export const DEFAULT_EGRESS_CONFIG: EgressProxyConfig = {
     // Grocery sites (authenticated via cookie injection)
     '*.dunnesstoresgrocery.com',
     'dunnesstoresgrocery.com',
-    '*.sts.dunnesstoresgrocery.com',
 
-    // Cloudflare (required for sites behind CF protection)
-    '*.cloudflare.com',
-    '*.cloudflareinsights.com',
+    // Cloudflare (specific services only)
+    'challenges.cloudflare.com',
+    'static.cloudflareinsights.com',
 
     // Common browsing targets (agent-browser needs these)
     'example.com',
-    '*.gvt1.com',
 
-    // Web search & browsing (agent-browser)
-    '*.google.com',
-    '*.googleapis.com',
-    '*.gstatic.com',
-    '*.bing.com',
-    '*.duckduckgo.com',
+    // Web search (specific subdomains — no *.google.com wildcard)
+    'www.google.com',
+    'www.googleapis.com',
+    'customsearch.googleapis.com',
+    'www.gstatic.com',
+    'www.bing.com',
+    'duckduckgo.com',
+    'html.duckduckgo.com',
+    'lite.duckduckgo.com',
 
     // Notion API (MCP integration)
     'api.notion.com',

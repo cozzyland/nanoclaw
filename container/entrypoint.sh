@@ -2,7 +2,17 @@
 set -e
 
 # Source environment from mounted env-dir (workaround for Apple Container -i bug)
-[ -f /workspace/env-dir/env ] && export $(cat /workspace/env-dir/env | xargs)
+# Safe parsing: allowlist specific variable names to prevent command injection,
+# PATH hijacking, and globbing attacks from malicious env values.
+if [ -f /workspace/env-dir/env ]; then
+  while IFS='=' read -r key value; do
+    case "$key" in
+      ''|\#*) continue ;; # Skip empty lines and comments
+      CLAUDE_CODE_OAUTH_TOKEN|VNC_PASSWORD|NOTION_TOKEN|ANTHROPIC_AUTH_TOKEN) export "$key=$value" ;;
+      *) ;; # Silently ignore unknown vars
+    esac
+  done < /workspace/env-dir/env
+fi
 
 # Clean stale agent-browser sessions
 rm -f ~/.agent-browser/*.pid ~/.agent-browser/*.sock 2>/dev/null || true

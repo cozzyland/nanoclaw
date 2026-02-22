@@ -25,6 +25,9 @@ import { generateAnalytics } from './analytics-queries.js';
 const NOTION_API = 'https://api.notion.com/v1';
 const NOTION_VERSION = '2022-06-28';
 const RATE_LIMIT_MS = 350;
+const MAX_RETRIES = 5;
+const MIN_RETRY_SECONDS = 1;
+const MAX_RETRY_SECONDS = 120;
 
 const DB_IDS = {
   tasks: '202327f4955881b1a00aca5d9300f666',
@@ -58,6 +61,7 @@ function sleep(ms: number): Promise<void> {
 async function notionFetch(
   endpoint: string,
   body?: object,
+  attempt = 0,
 ): Promise<unknown> {
   const token = getNotionToken();
   const res = await fetch(`${NOTION_API}${endpoint}`, {
@@ -71,10 +75,14 @@ async function notionFetch(
   });
 
   if (res.status === 429) {
-    const retryAfter = parseInt(res.headers.get('Retry-After') || '2', 10);
-    logger.warn({ retryAfter }, 'Notion rate limited, backing off');
+    if (attempt >= MAX_RETRIES) {
+      throw new Error(`Notion API: max retries (${MAX_RETRIES}) exceeded on 429`);
+    }
+    const raw = parseInt(res.headers.get('Retry-After') || '2', 10);
+    const retryAfter = Math.max(MIN_RETRY_SECONDS, Math.min(isNaN(raw) ? 2 : raw, MAX_RETRY_SECONDS));
+    logger.warn({ retryAfter, attempt: attempt + 1, maxRetries: MAX_RETRIES }, 'Notion rate limited, backing off');
     await sleep(retryAfter * 1000);
-    return notionFetch(endpoint, body);
+    return notionFetch(endpoint, body, attempt + 1);
   }
 
   if (!res.ok) {

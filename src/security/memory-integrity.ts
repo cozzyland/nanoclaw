@@ -169,12 +169,20 @@ export class MemoryIntegrity {
             // Existing file modified
             modifiedFiles.push({ path: entry, oldHash: beforeFile.hash, newHash: currentHash });
 
-            // Find added content (simple diff — lines in current but not in before)
+            // Scan both the added content (line diff) AND the full modified file
+            // Line diff catches new injections; full scan catches cross-line injections
+            // and modifications that bypass the line-based diff
             const addedContent = this.getAddedContent(beforeFile.content, currentContent);
-            if (addedContent) {
-              const findings = this.scanForSuspiciousContent(addedContent);
+            const textsToScan = [addedContent, currentContent].filter(Boolean);
+            const seenReasons = new Set<string>();
+            for (const text of textsToScan) {
+              const findings = this.scanForSuspiciousContent(text);
               for (const finding of findings) {
-                suspiciousChanges.push({ file: entry, ...finding });
+                // Deduplicate by reason to avoid double-reporting
+                if (!seenReasons.has(finding.reason)) {
+                  seenReasons.add(finding.reason);
+                  suspiciousChanges.push({ file: entry, ...finding });
+                }
               }
             }
           }

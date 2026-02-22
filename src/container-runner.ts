@@ -243,7 +243,7 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   const egressProxyUrl = `http://${limaGatewayIp}:${process.env.EGRESS_PROXY_PORT || '3002'}`;
   args.push('-e', `HTTP_PROXY=${egressProxyUrl}`);
   args.push('-e', `HTTPS_PROXY=${egressProxyUrl}`);
-  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,api.notion.com,${limaGatewayIp}`);
+  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,${limaGatewayIp}`);
 
   // Phase 6: Content scanning services accessible from containers
   args.push('-e', `CLAMAV_HOST=${limaGatewayIp}`);
@@ -251,10 +251,10 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   args.push('-e', `PROMPT_GUARD_URL=http://${limaGatewayIp}:3003`);
 
   // Notion MCP integration
-  const notionToken = process.env.NOTION_TOKEN;
-  if (notionToken) {
-    args.push('-e', `NOTION_TOKEN=${notionToken}`);
-  }
+  // NOTION_TOKEN is NOT passed to the container — it stays host-only (notion-sync.ts, webhook-server.ts).
+  // The container accesses Notion data via pre-computed cache snapshots (notion_cache.json, analytics_cache.json)
+  // written to the IPC directory before container spawn. Direct Notion API calls from the container
+  // should use the Notion MCP server which reads the token from the host environment.
 
   // Anti-detection flags for agent-browser (Chromium)
   // --disable-blink-features=AutomationControlled: hides navigator.webdriver flag from bot detectors

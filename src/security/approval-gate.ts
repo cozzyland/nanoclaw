@@ -118,14 +118,17 @@ export class ApprovalGate {
     // Persist to database
     this.deps.createApprovalRequest(request);
 
+    // Generate a short approval code for this specific request
+    const approvalCode = action.id.slice(-4).toUpperCase();
+
     // Send approval message to chat
     const timeoutMin = Math.round(action.timeoutMs / 60_000);
     const message = [
-      '[APPROVAL REQUIRED]',
+      `[APPROVAL REQUIRED — ${approvalCode}]`,
       '',
       action.description,
       '',
-      `Reply YES to approve or NO to deny.`,
+      `Reply "APPROVE ${approvalCode}" to approve or "DENY ${approvalCode}" to deny.`,
       `Auto-denied in ${timeoutMin} minutes.`,
     ].join('\n');
 
@@ -169,11 +172,17 @@ export class ApprovalGate {
    * Returns true if the message was an approval response (consumed).
    */
   handleResponse(messageContent: string, senderJid: string, chatJid: string): boolean {
-    const trimmed = messageContent.trim().toLowerCase();
-    const isApproval = /^(yes|approve|confirmed?|ok|go ahead)$/i.test(trimmed);
-    const isDenial = /^(no|deny|denied|reject|cancel|stop)$/i.test(trimmed);
+    const trimmed = messageContent.trim();
 
-    if (!isApproval && !isDenial) return false;
+    // Require specific format: "APPROVE <code>" or "DENY <code>"
+    // This prevents accidental approvals from generic words like "ok" or "go ahead"
+    const approveMatch = trimmed.match(/^approve\s+([A-Z0-9]{4})$/i);
+    const denyMatch = trimmed.match(/^deny\s+([A-Z0-9]{4})$/i);
+
+    if (!approveMatch && !denyMatch) return false;
+
+    const code = (approveMatch?.[1] || denyMatch?.[1] || '').toUpperCase();
+    const isApproval = !!approveMatch;
 
     // Find pending approvals for this chat
     const pending = this.deps.getPendingApprovals(chatJid);
@@ -190,8 +199,12 @@ export class ApprovalGate {
       return false;
     }
 
-    // Take the most recent pending request
-    const request = pending[pending.length - 1];
+    // Find the specific request matching the approval code
+    const request = pending.find(r => r.id.slice(-4).toUpperCase() === code);
+    if (!request) {
+      logger.debug({ code, chatJid }, 'Approval code does not match any pending request');
+      return false;
+    }
     const approved = isApproval;
 
     // Update database
@@ -235,13 +248,16 @@ export class ApprovalGate {
   private checkTimeouts(): void {
     const expired = this.deps.getExpiredApprovals();
     for (const request of expired) {
-      this.deps.expireApproval(request.id);
-
+      // Guard: only process if callback still exists (prevents double-resolve race)
       const callback = this.pendingCallbacks.get(request.id);
       if (callback) {
-        clearTimeout(callback.timer);
         this.pendingCallbacks.delete(request.id);
+        clearTimeout(callback.timer);
+        this.deps.expireApproval(request.id);
         callback.resolve({ approved: false, timedOut: true });
+      } else {
+        // Callback already resolved by handleResponse, just clean up DB
+        this.deps.expireApproval(request.id);
       }
     }
   }

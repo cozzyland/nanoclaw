@@ -519,7 +519,9 @@ async function main(): Promise<void> {
   // Proxies Anthropic API requests and injects credentials at runtime
   // Agents never see the real API key
   const credProxyPort = parseInt(process.env.CREDENTIAL_PROXY_PORT || '3001', 10);
-  await startCredentialProxy(credProxyPort, '0.0.0.0');
+  // Bind to Lima gateway IP only — prevents LAN access to the credential proxy
+  const limaGatewayIp = '192.168.64.1';
+  await startCredentialProxy(credProxyPort, limaGatewayIp);
   logger.info({ port: credProxyPort }, 'Credential proxy started');
 
   // Start network egress proxy (Phase 5: Network Egress Filtering)
@@ -527,7 +529,7 @@ async function main(): Promise<void> {
   // Blocks unauthorized domains and prevents data exfiltration
   const egressProxyPort = parseInt(process.env.EGRESS_PROXY_PORT || '3002', 10);
   const egressProxy = new EgressProxy(DEFAULT_EGRESS_CONFIG);
-  await egressProxy.start(egressProxyPort, '0.0.0.0');
+  await egressProxy.start(egressProxyPort, limaGatewayIp);
   logger.info({ port: egressProxyPort }, 'Network egress proxy started');
 
   // Phase 6: Content Scanning Services

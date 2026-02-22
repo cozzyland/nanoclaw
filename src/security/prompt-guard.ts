@@ -9,6 +9,7 @@
  */
 
 import { logger } from '../logger.js';
+import { securityEvents } from './security-events.js';
 
 export interface ClassificationResult {
   label: 'BENIGN' | 'INJECTION' | 'JAILBREAK';
@@ -45,8 +46,17 @@ export class PromptGuard {
     }
   }
 
-  async classify(text: string): Promise<ClassificationResult> {
+  async classify(text: string, groupId?: string): Promise<ClassificationResult> {
     if (!this.ready) {
+      securityEvents.log({
+        type: 'prompt_injection',
+        severity: 'high',
+        source: 'prompt-guard',
+        description: 'Prompt Guard not ready — failing open, injection detection bypassed',
+        details: { textLength: text.length },
+        actionTaken: 'Message allowed without injection scan',
+        groupId,
+      });
       return { label: 'BENIGN', score: 0, blocked: false };
     }
 
@@ -60,6 +70,15 @@ export class PromptGuard {
 
       if (!res.ok) {
         logger.warn({ status: res.status }, 'Prompt Guard classify request failed');
+        securityEvents.log({
+          type: 'prompt_injection',
+          severity: 'high',
+          source: 'prompt-guard',
+          description: `Prompt Guard classify failed (HTTP ${res.status}) — failing open`,
+          details: { status: res.status, textLength: text.length },
+          actionTaken: 'Message allowed without injection scan',
+          groupId,
+        });
         return { label: 'BENIGN', score: 0, blocked: false };
       }
 
@@ -74,8 +93,17 @@ export class PromptGuard {
 
       return { label, score, blocked };
     } catch (err) {
-      // Timeout or network error — fail open
+      // Timeout or network error — fail open but log it
       logger.debug({ err }, 'Prompt Guard request failed, allowing message through');
+      securityEvents.log({
+        type: 'prompt_injection',
+        severity: 'high',
+        source: 'prompt-guard',
+        description: 'Prompt Guard timeout/error — failing open',
+        details: { error: String(err), textLength: text.length },
+        actionTaken: 'Message allowed without injection scan',
+        groupId,
+      });
       return { label: 'BENIGN', score: 0, blocked: false };
     }
   }

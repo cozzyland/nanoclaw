@@ -100,6 +100,15 @@ export class OutputMonitor {
       return { allowed, flags, riskLevel };
     } catch (err) {
       logger.error({ err }, 'Output monitor error — failing open');
+      securityEvents.log({
+        type: 'outbound_blocked',
+        severity: 'high',
+        source: 'output-monitor',
+        description: 'Output monitor error — failing open, outbound scan bypassed',
+        details: { error: String(err), textLength: text.length },
+        actionTaken: 'Message allowed without outbound scan',
+        groupId: context.groupFolder,
+      });
       return { allowed: true, flags: [], riskLevel: 'low' };
     }
   }

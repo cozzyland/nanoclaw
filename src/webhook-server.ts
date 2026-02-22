@@ -1,3 +1,4 @@
+import crypto from 'crypto';
 import express from 'express';
 
 import { MAIN_GROUP_FOLDER } from './config.js';
@@ -6,6 +7,37 @@ import { logger } from './logger.js';
 
 const MAIN_JID = process.env.NANOCLAW_OWNER_JID || '';
 
+// Simple in-memory rate limiter for webhook endpoint
+const rateLimitWindow = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_MAX = 10; // max requests per minute
+const RATE_LIMIT_WINDOW_MS = 60_000;
+
+function checkRateLimit(ip: string): boolean {
+  const now = Date.now();
+  const entry = rateLimitWindow.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitWindow.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW_MS });
+    return true;
+  }
+  if (entry.count >= RATE_LIMIT_MAX) return false;
+  entry.count++;
+  return true;
+}
+
+/**
+ * Sanitize a Notion page title for safe use in agent prompts.
+ * Strips newlines, quotes, control chars, and truncates to prevent prompt injection.
+ */
+function sanitizePageTitle(raw: unknown): string {
+  if (typeof raw !== 'string') return 'unknown item';
+  return raw
+    .replace(/[\n\r\t]/g, ' ')       // Replace newlines/tabs with spaces
+    .replace(/["\\]/g, '')            // Strip quotes and backslashes
+    .replace(/[^\x20-\x7E\u00A0-\uFFFF]/g, '') // Strip control characters
+    .trim()
+    .slice(0, 200) || 'unknown item'; // Truncate to 200 chars
+}
+
 export function startWebhookServer(
   port: number,
   secret: string,
@@ -13,17 +45,29 @@ export function startWebhookServer(
   runTaskFn: (taskId: string) => Promise<void>,
 ): void {
   const app = express();
-  app.use(express.json());
+  app.use(express.json({ limit: '16kb' })); // Webhook payloads are small
 
   app.post('/notion/inbox', (req, res) => {
-    if (req.headers['x-webhook-secret'] !== secret) {
+    // Rate limiting
+    const clientIp = req.ip || 'unknown';
+    if (!checkRateLimit(clientIp)) {
+      return res.sendStatus(429);
+    }
+
+    // Timing-safe secret comparison (prevents timing side-channel attacks)
+    const headerValue = req.headers['x-webhook-secret'];
+    if (
+      typeof headerValue !== 'string' ||
+      headerValue.length !== secret.length ||
+      !crypto.timingSafeEqual(Buffer.from(headerValue), Buffer.from(secret))
+    ) {
       return res.sendStatus(401);
     }
 
-    const name =
+    const rawName =
       req.body?.data?.properties?.Name?.title?.[0]?.plain_text ||
-      req.body?.data?.properties?.Name ||
       'unknown item';
+    const name = sanitizePageTitle(rawName);
     const notionPageId: string | undefined = req.body?.data?.id;
 
     const taskId = `webhook-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
@@ -31,7 +75,7 @@ export function startWebhookServer(
       id: taskId,
       group_folder: MAIN_GROUP_FOLDER,
       chat_jid: MAIN_JID,
-      prompt: `A new item was just added to SB_Inbox: "${name}". Process it immediately following the Inbox Processing instructions in CLAUDE.md. Query SB_Inbox for this item and any other unprocessed items, then triage them. Use mcp__nanoclaw__send_message to report what you processed.`,
+      prompt: `[SYSTEM INSTRUCTION: Process new SB_Inbox item per CLAUDE.md Inbox Processing instructions. Query SB_Inbox for this item and any other unprocessed items, then triage them. Use mcp__nanoclaw__send_message to report what you processed.]\n\n[ITEM TITLE]: ${name}`,
       schedule_type: 'once',
       schedule_value: new Date().toISOString(),
       context_mode: 'isolated',

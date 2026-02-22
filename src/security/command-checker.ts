@@ -75,11 +75,35 @@ export function assessCommandRisk(
     safeAlternatives.push('git stash');
   }
 
-  // CRITICAL: Recursive file deletion
-  if (/rm\s+-r(f)?.*\/(?!tmp)/i.test(command)) {
+  // CRITICAL: Recursive file deletion (catches -rf, -fr, --recursive, etc.)
+  if (/rm\s+(-\w*r\w*|--recursive)\b/i.test(command) && !/\/tmp\b/.test(command)) {
     reasons.push('rm -rf outside /tmp can delete important files');
     riskLevel = 'critical';
     safeAlternatives.push('rm specific files instead of recursive deletion');
+  }
+
+  // CRITICAL: Shell command obfuscation / indirect execution
+  if (/\beval\s/i.test(command) || /\bsource\s/i.test(command) || /\bexec\s/i.test(command)) {
+    reasons.push('Indirect command execution (eval/source/exec) can hide malicious code');
+    riskLevel = 'critical';
+  }
+
+  // CRITICAL: Pipe-to-shell patterns (base64 decode + execute, curl | sh, etc.)
+  if (/\|\s*(ba)?sh\b/i.test(command) || /\|\s*bash\b/i.test(command)) {
+    reasons.push('Pipe-to-shell pattern detected — possible code injection');
+    riskLevel = 'critical';
+  }
+
+  // CRITICAL: Base64 decode to execution
+  if (/base64\s+(-d|--decode)/i.test(command)) {
+    reasons.push('Base64 decode detected — possible obfuscated command execution');
+    riskLevel = 'critical';
+  }
+
+  // CRITICAL: Command substitution with dangerous operations
+  if (/\$\(.*\b(curl|wget|nc|netcat)\b/i.test(command) || /`.*\b(curl|wget|nc|netcat)\b/i.test(command)) {
+    reasons.push('Command substitution with network tool — possible exfiltration');
+    riskLevel = 'critical';
   }
 
   // HIGH: Data exfiltration attempts
@@ -94,16 +118,22 @@ export function assessCommandRisk(
     riskLevel = 'high';
   }
 
+  // HIGH: Network tools — check target against allowlist
+  const networkMatch = command.match(/\b(curl|wget|nc|netcat)\s+(?:-\S+\s+)*(\S+)/i);
+  if (networkMatch) {
+    const target = networkMatch[2];
+    const ALLOWED_NETWORK_HOSTS = ['api.anthropic.com', 'github.com', 'npmjs.org', 'registry.npmjs.org', 'api.notion.com'];
+    const isAllowed = ALLOWED_NETWORK_HOSTS.some(host => target.includes(host));
+    if (!isAllowed) {
+      reasons.push(`Network request to potentially unauthorized target: ${target.slice(0, 80)}`);
+      if (riskLevel === 'low') riskLevel = 'high';
+    }
+  }
+
   // MEDIUM: Accessing credentials
   if (/\$ANTHROPIC_API_KEY|\$CLAUDE_CODE_OAUTH_TOKEN|cat.*\.env/i.test(command)) {
     reasons.push('Command accesses sensitive credentials');
-    riskLevel = 'medium';
-  }
-
-  // MEDIUM: Network access to unknown domains
-  if (/(curl|wget|nc|netcat)\s+.*(?!api\.anthropic\.com|github\.com|npmjs\.org)/i.test(command)) {
-    reasons.push('Network request to potentially unauthorized domain');
-    riskLevel = 'medium';
+    if (riskLevel === 'low') riskLevel = 'medium';
   }
 
   // MEDIUM: Command chaining (could hide malicious operations)
@@ -171,15 +201,17 @@ export async function llmJudgeCommand(
     };
   }
 
-  if (patternAssessment.riskLevel === 'low' && command.length < 50) {
+  // Skip LLM for short, low-risk commands WITHOUT shell metacharacters
+  const hasShellMeta = /[`$|;()\{\}]/.test(command);
+  if (patternAssessment.riskLevel === 'low' && command.length < 50 && !hasShellMeta) {
     return {
       isSafe: true,
       explanation: 'No security concerns detected',
     };
   }
 
-  // Check cache
-  const cacheKey = command;
+  // Check cache (include trust context to prevent cross-context poisoning)
+  const cacheKey = `${command}::${context.isMain ? 'main' : 'secondary'}`;
   const cached = llmCache.get(cacheKey);
   if (cached && cached.expiry > Date.now()) {
     return cached.result;
@@ -213,8 +245,8 @@ SAFE if: normal assistant operations (file read/write, web browsing, package ins
           content: `Command: ${command}\nTrust level: ${context.isMain ? 'high (main group)' : 'low (secondary group)'}`,
         }],
       }),
-      // 200ms timeout
-      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('LLM timeout')), 200)),
+      // 3000ms timeout (200ms was too aggressive — cold Haiku calls need 500-2000ms)
+      new Promise<never>((_, reject) => setTimeout(() => reject(new Error('LLM timeout')), 3000)),
     ]);
 
     const text = response.content[0].type === 'text' ? response.content[0].text : '';

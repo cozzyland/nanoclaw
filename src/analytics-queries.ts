@@ -48,6 +48,13 @@ const HABITS = [
   'piano', 'b2b', 'ate_healthy', 'micro_d',
 ] as const;
 
+// Validate column names at module load to prevent SQL injection via array modification
+for (const h of HABITS) {
+  if (!/^[a-z0-9_]+$/.test(h)) {
+    throw new Error(`Invalid habit column name: ${h}`);
+  }
+}
+
 /**
  * Habit-mood correlation: for each habit, compare avg evening mood
  * on days habit was done vs not done.

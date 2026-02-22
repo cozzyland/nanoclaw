@@ -17,6 +17,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import path from 'path';
 
+import { getDb } from '../db.js';
 import { logger } from '../logger.js';
 
 export interface DeployedCanary {
@@ -34,11 +35,27 @@ export interface CanaryStatus {
 
 export class CanaryDeployer {
   private groupsDir: string;
-  // Store expected canary hashes per group
-  private canaryHashes = new Map<string, Map<string, string>>();
 
   constructor(groupsDir: string) {
     this.groupsDir = groupsDir;
+    this.ensureTable();
+  }
+
+  /** Create the canary_hashes table if it doesn't exist */
+  private ensureTable(): void {
+    try {
+      const db = getDb();
+      db.exec(`CREATE TABLE IF NOT EXISTS canary_hashes (
+        group_folder TEXT NOT NULL,
+        file_name TEXT NOT NULL,
+        hash TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (group_folder, file_name)
+      )`);
+    } catch {
+      // DB might not be initialized yet during testing
+      logger.debug('canary_hashes table creation deferred');
+    }
   }
 
   /**
@@ -128,20 +145,20 @@ export class CanaryDeployer {
    */
   async verify(groupFolder: string): Promise<CanaryStatus> {
     const groupDir = path.join(this.groupsDir, groupFolder);
-    const hashes = this.canaryHashes.get(groupFolder);
+    const hashes = this.getStoredHashes(groupFolder);
 
-    if (!hashes || hashes.size === 0) {
+    if (hashes.length === 0) {
       return { intact: true, missing: [], tampered: [] };
     }
 
     const missing: string[] = [];
     const tampered: string[] = [];
 
-    for (const [fileName, expectedHash] of hashes) {
-      const filePath = path.join(groupDir, fileName);
+    for (const { file_name, hash: expectedHash } of hashes) {
+      const filePath = path.join(groupDir, file_name);
 
       if (!fs.existsSync(filePath)) {
-        missing.push(fileName);
+        missing.push(file_name);
         continue;
       }
 
@@ -149,7 +166,7 @@ export class CanaryDeployer {
       const currentHash = crypto.createHash('sha256').update(currentContent).digest('hex');
 
       if (currentHash !== expectedHash) {
-        tampered.push(fileName);
+        tampered.push(file_name);
       }
     }
 
@@ -165,13 +182,26 @@ export class CanaryDeployer {
     return { intact, missing, tampered };
   }
 
+  /** Persist canary hash to SQLite (survives process restarts) */
   private storeCanaryHash(groupFolder: string, fileName: string, content: string): void {
     const hash = crypto.createHash('sha256').update(content).digest('hex');
-    let groupHashes = this.canaryHashes.get(groupFolder);
-    if (!groupHashes) {
-      groupHashes = new Map();
-      this.canaryHashes.set(groupFolder, groupHashes);
+    try {
+      const db = getDb();
+      db.prepare(`INSERT OR REPLACE INTO canary_hashes (group_folder, file_name, hash, created_at)
+        VALUES (?, ?, ?, datetime('now'))`).run(groupFolder, fileName, hash);
+    } catch {
+      logger.debug({ groupFolder, fileName }, 'Failed to persist canary hash to DB');
     }
-    groupHashes.set(fileName, hash);
+  }
+
+  /** Load stored hashes from SQLite */
+  private getStoredHashes(groupFolder: string): Array<{ file_name: string; hash: string }> {
+    try {
+      const db = getDb();
+      return db.prepare('SELECT file_name, hash FROM canary_hashes WHERE group_folder = ?')
+        .all(groupFolder) as Array<{ file_name: string; hash: string }>;
+    } catch {
+      return [];
+    }
   }
 }
