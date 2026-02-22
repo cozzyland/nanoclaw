@@ -355,6 +355,46 @@ You have full access to the user's Notion workspace via `mcp__notion__*` tools. 
 
 For full schemas, relation details, views, and data source IDs: read `/workspace/group/notion-reference.md`
 
+### Local SQLite Cache
+
+The host process syncs Notion data to a local SQLite database every 6 hours. Use this cache for fast lookups instead of API calls when data freshness allows.
+
+**Cache snapshot:** `/workspace/ipc/notion_cache.json` — written before each container spawn. Contains:
+- `syncStatus`: `complete` | `syncing` | `failed` | `unknown`
+- `lastSync`: ISO timestamp of last successful sync
+- `paraItems`: All PARA items with name, category, status, relation counts
+- `dailyPages`: Last 30 Daily Pages with all properties
+
+**Analytics snapshot:** `/workspace/ipc/analytics_cache.json` — pre-computed analytics:
+- `habitCorrelation`: Per-habit average mood comparison (done vs not done)
+- `taskCompletion`: Task completion rate over 30 days
+- `knowledgeGaps`: Active PARA items missing tasks/notes/content
+- `messageActionRate`: Messages received vs Notion creates (7 days)
+- `taskHealth`: Task execution success/error rates and durations
+
+**Direct SQLite queries** (for data not in snapshots):
+```bash
+# Active PARA items
+sqlite3 /workspace/project/store/messages.db "SELECT name, category, status, task_count, note_count FROM notion_para_cache WHERE status='Active'"
+
+# Recent Daily Pages
+sqlite3 /workspace/project/store/messages.db "SELECT date, mood_evening, prayer, piano, tasks_done FROM notion_daily_pages_cache WHERE date >= date('now', '-7 days') ORDER BY date"
+
+# Relation count
+sqlite3 /workspace/project/store/messages.db "SELECT COUNT(*) FROM notion_relation_cache"
+
+# Relations for a specific PARA item
+sqlite3 /workspace/project/store/messages.db "SELECT target_db, target_page_id, relation_property FROM notion_relation_cache WHERE source_page_id = 'PAGE_ID'"
+
+# Sync log (traceability)
+sqlite3 /workspace/project/store/messages.db "SELECT direction, operation, notion_db, notion_page_id, trigger_type, created_at FROM notion_sync_log ORDER BY created_at DESC LIMIT 20"
+```
+
+**When to use cache vs API:**
+- Cache `synced_at` within 6 hours → trust cache, skip API
+- Cache stale or `syncStatus` = `failed` → fall back to direct Notion API
+- Writing to Notion → always use MCP/curl (cache is read-only)
+
 ---
 
 ## Autonomous Behavior
@@ -460,9 +500,11 @@ Run after the SB Maintenance Sweep. Analyze the health and utilisation of the Se
 
 **IMPORTANT:** Send a brief progress update via `send_message` every 5-10 minutes during long analytics runs (e.g., "Analyzing Daily Pages... 15/30 complete"). This prevents the container from being terminated for inactivity.
 
+**Pre-computed analytics:** Read `/workspace/ipc/analytics_cache.json` first. It contains habit-mood correlations, task completion rate, knowledge gaps, message→action rate, and task execution health — all pre-computed by the host. Use this instead of querying Notion API directly for Parts 1-2. Focus your effort on interpretation and insights, not data collection.
+
 **Part 1: Knowledge Gap Analysis**
-1. Query all Active PARA items via direct Notion API (see `notion-reference.md` Section 8, "Direct API Query Patterns")
-2. For each item, count linked Tasks, Notes, Content via `relation.contains` filter (3 requests per PARA item)
+1. Read `knowledgeGaps` from `/workspace/ipc/analytics_cache.json` — it lists Active PARA items with 0 tasks, notes, or content
+2. For items not in cache, query via direct Notion API as fallback (see `notion-reference.md` Section 8, "Direct API Query Patterns")
 3. Flag "knowledge deserts" — Active Areas/Projects with:
    - 0 linked Notes (no captured knowledge)
    - 0 linked Content (no inputs)
@@ -470,25 +512,30 @@ Run after the SB Maintenance Sweep. Analyze the health and utilisation of the Se
 4. Flag "information overload" — items with 10+ Notes but no Polished notes (lots of input, no distillation)
 
 **Part 2: Productivity Analytics (from Daily Pages)**
-5. Query last 30 Daily Pages via direct Notion API (date filter: `on_or_after` 30 days ago)
-6. Compute and report:
-   - Task completion rate: (Done tasks / total tasks with Do on in period)
-   - Habit consistency: per-habit completion % (Prayer, Rosary, Piano, etc.)
-   - Mood correlation matrix: which habits correlate with higher mood?
-   - Sleep-productivity link: sleep quality vs. next-day task completion
-   - Energy patterns: which days of the week have highest mood/wakefulness?
+5. Read `habitCorrelation` and `taskCompletion` from `/workspace/ipc/analytics_cache.json` — pre-computed for last 30 days
+6. Interpret and report:
+   - Task completion rate (from `taskCompletion.rate`)
+   - Habit consistency: per-habit completion % (from `habitCorrelation[].days_done` / total days)
+   - Mood correlation matrix: habits with highest `avg_mood_with` - `avg_mood_without` delta
+   - For sleep-productivity and energy patterns, query SQLite directly if needed:
+     ```bash
+     sqlite3 /workspace/project/store/messages.db "SELECT date, mood_evening, sleep_good, tasks_done FROM notion_daily_pages_cache WHERE date >= date('now', '-30 days') ORDER BY date"
+     ```
 7. Compare to previous period (if previous analytics file exists in `/workspace/group/analytics/`)
-8. If fewer than 7 Daily Pages exist, note: "Only [N] Daily Pages in the last 30 days — analytics may not be representative. Consider logging daily for richer insights." Skip mood/habit correlation analysis if fewer than 7 data points.
+8. If fewer than 7 Daily Pages in cache, note: "Only [N] Daily Pages in the last 30 days — analytics may not be representative."
 
 **Part 3: Content Pipeline**
-9. Count SB_Content by status: Not started / In progress / Done
+9. Count SB_Content by status: Not started / In progress / Done (query Notion API — content not cached)
 10. Flag content items "Not started" for 30+ days
-11. Surface content items that match active Projects (recommend what to read next)
+11. Surface content items that match active Projects (use PARA cache for matching)
 
 **Part 4: Relation Health**
-12. Count total relations across all databases
+12. Count total relations from SQLite:
+    ```bash
+    sqlite3 /workspace/project/store/messages.db "SELECT COUNT(*) FROM notion_relation_cache"
+    ```
 13. Compare to previous week — are relations growing? (Target: +5-10/week from normal usage)
-14. Flag the top 3 items that would benefit most from linking
+14. Flag the top 3 items that would benefit most from linking (use `knowledgeGaps` from analytics cache)
 
 **Output:**
 - Store full analytics in `/workspace/group/analytics/weekly-{date}.md` (e.g., `weekly-2026-02-22.md`)
@@ -727,14 +774,19 @@ If the user says "move that to X", "that should be under Y", or "wrong category"
 
 When the user asks to search their Second Brain, research a topic, or find connections:
 
-1. **Build the search space** — query across all 5 databases using hybrid search:
-   - **Phase 1 (Deterministic):** Direct Notion API queries with filters for each database. Use `relation.contains` filter to traverse PARA→Tasks/Notes/Content in 3 requests per PARA item (see `notion-reference.md` Section 8, "Direct API Query Patterns"):
-     - SB_PARA: title/keyword match
+1. **Build the search space** — check local cache first, then API:
+   - **Phase 0 (Cache):** Check local SQLite cache first for instant results:
+     ```bash
+     sqlite3 /workspace/project/store/messages.db "SELECT name, category, status, task_count, note_count, content_count FROM notion_para_cache WHERE status='Active' AND name LIKE '%keyword%'"
+     ```
+     Also read `/workspace/ipc/notion_cache.json` for the full PARA/Daily Pages snapshot. If `syncStatus` is `complete` and `lastSync` is within 6 hours, trust the cache and skip Phase 1 for PARA queries.
+   - **Phase 1 (Deterministic):** Direct Notion API queries for items NOT in cache or when cache is stale. Use `relation.contains` filter to traverse PARA→Tasks/Notes/Content in 3 requests per PARA item (see `notion-reference.md` Section 8, "Direct API Query Patterns"):
+     - SB_PARA: title/keyword match (skip if cache hit)
      - SB_Tasks: tasks linked to matching PARA items
      - SB_Notes: search by AI keywords and title
      - SB_Content: search by title and type
-     - SB_Daily Pages: search for relevant habit/mood data if health/wellness topic
-   - **Phase 2 (Probabilistic):** MCP `notion-search` for content/body text matches (complements Phase 1 — catches content the API filter misses)
+     - SB_Daily Pages: search for relevant habit/mood data if health/wellness topic (use cache for last 30 days)
+   - **Phase 2 (Probabilistic):** MCP `notion-search` for content/body text matches (complements cache + Phase 1 — catches content the filters miss)
    - **Phase 3:** Deduplicate results by page ID and rank by relevance
 
 2. **Synthesize findings:**

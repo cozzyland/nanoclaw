@@ -1,7 +1,7 @@
 import express from 'express';
 
 import { MAIN_GROUP_FOLDER } from './config.js';
-import { createTask } from './db.js';
+import { createTask, logNotionSync } from './db.js';
 import { logger } from './logger.js';
 
 const MAIN_JID = process.env.NANOCLAW_OWNER_JID || '';
@@ -24,6 +24,7 @@ export function startWebhookServer(
       req.body?.data?.properties?.Name?.title?.[0]?.plain_text ||
       req.body?.data?.properties?.Name ||
       'unknown item';
+    const notionPageId: string | undefined = req.body?.data?.id;
 
     const taskId = `webhook-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`;
     createTask({
@@ -37,11 +38,23 @@ export function startWebhookServer(
       next_run: null,
       status: 'active',
       created_at: new Date().toISOString(),
+      notion_page_id: notionPageId,
+    });
+
+    logNotionSync({
+      direction: 'notion_to_local',
+      operation: 'create',
+      notion_db: 'inbox',
+      notion_page_id: notionPageId,
+      trigger_type: 'webhook',
+      trigger_id: taskId,
+      group_folder: MAIN_GROUP_FOLDER,
+      details: JSON.stringify({ name }),
     });
 
     enqueueTask(MAIN_JID, taskId, () => runTaskFn(taskId));
 
-    logger.info({ taskId, name }, 'Notion webhook received, task enqueued');
+    logger.info({ taskId, name, notionPageId }, 'Notion webhook received, task enqueued');
     res.sendStatus(200);
   });
 

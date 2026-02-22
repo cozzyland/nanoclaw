@@ -47,6 +47,7 @@ import { PromptGuard } from './security/prompt-guard.js';
 import { OutputMonitor } from './security/output-monitor.js';
 import { VirusTotalScanner } from './security/virustotal.js';
 import { MemoryIntegrity } from './security/memory-integrity.js';
+import { writeCacheSnapshot, fullSync } from './notion-sync.js';
 import { CanaryDeployer } from './security/canary-tokens.js';
 import {
   ApprovalGate,
@@ -289,6 +290,11 @@ async function runAgent(
     availableGroups,
     new Set(Object.keys(registeredGroups)),
   );
+
+  // Write Notion cache snapshot for the agent (main group only)
+  if (isMain) {
+    writeCacheSnapshot(group.folder);
+  }
 
   // Wrap onOutput to track session ID from streamed results
   const wrappedOnOutput = onOutput
@@ -615,6 +621,27 @@ async function main(): Promise<void> {
     },
   };
   startSchedulerLoop(schedulerDeps);
+
+  // Notion cache sync (every 6 hours, skip if no NOTION_TOKEN)
+  const SYNC_INTERVAL_MS = 6 * 60 * 60 * 1000;
+  if (process.env.NOTION_TOKEN) {
+    // Initial sync after 30s delay (let service stabilize)
+    setTimeout(() => {
+      fullSync().catch((err) =>
+        logger.error({ err }, 'Initial Notion sync failed'),
+      );
+    }, 30_000);
+
+    setInterval(() => {
+      if (!queue.isAnyActive()) {
+        fullSync().catch((err) =>
+          logger.error({ err }, 'Periodic Notion sync failed'),
+        );
+      } else {
+        logger.info('Skipping Notion sync — container active');
+      }
+    }, SYNC_INTERVAL_MS);
+  }
 
   // Notion webhook server (real-time inbox processing)
   const webhookSecret = process.env.NOTION_WEBHOOK_SECRET;

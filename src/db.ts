@@ -83,6 +83,104 @@ function createSchema(database: Database.Database): void {
     /* column already exists */
   }
 
+  // Add notion_page_id column for bidirectional traceability (Phase 2)
+  try {
+    database.exec(`ALTER TABLE scheduled_tasks ADD COLUMN notion_page_id TEXT`);
+  } catch {
+    /* column already exists */
+  }
+  database.exec(`CREATE INDEX IF NOT EXISTS idx_tasks_notion_page ON scheduled_tasks(notion_page_id)`);
+
+  // Notion cache tables (Phase 1)
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS notion_para_cache (
+      page_id TEXT PRIMARY KEY,
+      name TEXT NOT NULL,
+      category TEXT,
+      status TEXT,
+      deadline TEXT,
+      parent_para_id TEXT,
+      task_count INTEGER DEFAULT 0,
+      note_count INTEGER DEFAULT 0,
+      content_count INTEGER DEFAULT 0,
+      synced_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_para_cache_status ON notion_para_cache(status);
+    CREATE INDEX IF NOT EXISTS idx_para_cache_category ON notion_para_cache(category);
+
+    CREATE TABLE IF NOT EXISTS notion_relation_cache (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      source_db TEXT NOT NULL,
+      source_page_id TEXT NOT NULL,
+      target_db TEXT NOT NULL,
+      target_page_id TEXT NOT NULL,
+      relation_property TEXT NOT NULL,
+      synced_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_relation_source ON notion_relation_cache(source_db, source_page_id);
+    CREATE INDEX IF NOT EXISTS idx_relation_target ON notion_relation_cache(target_db, target_page_id);
+
+    CREATE TABLE IF NOT EXISTS notion_daily_pages_cache (
+      page_id TEXT PRIMARY KEY,
+      title TEXT,
+      date TEXT NOT NULL,
+      mood_morning TEXT,
+      mood_evening TEXT,
+      wakefulness_morning TEXT,
+      wakefulness_evening TEXT,
+      concerta_mg REAL,
+      pregabalin_mg REAL,
+      caffeine_mg REAL,
+      creatine_mg REAL,
+      alcohol_units REAL,
+      sleepies INTEGER,
+      micro_d INTEGER DEFAULT 0,
+      prayer INTEGER DEFAULT 0,
+      rosary INTEGER DEFAULT 0,
+      mass INTEGER DEFAULT 0,
+      theological_reflections INTEGER DEFAULT 0,
+      piano INTEGER DEFAULT 0,
+      b2b INTEGER DEFAULT 0,
+      ate_healthy INTEGER DEFAULT 0,
+      workout TEXT,
+      time_asleep TEXT,
+      deep_sleep TEXT,
+      awake TEXT,
+      night_wakings INTEGER,
+      lights_out TEXT,
+      sleep_good INTEGER DEFAULT 0,
+      sleep_bad INTEGER DEFAULT 0,
+      angry_outburst INTEGER DEFAULT 0,
+      fionn_woke INTEGER DEFAULT 0,
+      midnight_snack INTEGER DEFAULT 0,
+      too_late_to_bed INTEGER DEFAULT 0,
+      headache TEXT,
+      win TEXT,
+      tasks_done INTEGER DEFAULT 0,
+      tasks_total INTEGER DEFAULT 0,
+      synced_at TEXT NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_daily_pages_date ON notion_daily_pages_cache(date);
+
+    CREATE TABLE IF NOT EXISTS notion_sync_log (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      direction TEXT NOT NULL,
+      operation TEXT NOT NULL,
+      notion_db TEXT NOT NULL,
+      notion_page_id TEXT,
+      trigger_type TEXT NOT NULL,
+      trigger_id TEXT,
+      group_folder TEXT,
+      details TEXT,
+      status TEXT NOT NULL DEFAULT 'success',
+      error_message TEXT,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_sync_log_page ON notion_sync_log(notion_page_id);
+    CREATE INDEX IF NOT EXISTS idx_sync_log_trigger ON notion_sync_log(trigger_type, trigger_id);
+    CREATE INDEX IF NOT EXISTS idx_sync_log_created ON notion_sync_log(created_at);
+  `);
+
   // Phase 2: Approval gate requests table
   database.exec(`
     CREATE TABLE IF NOT EXISTS approval_requests (
@@ -108,6 +206,8 @@ export function initDatabase(): void {
   fs.mkdirSync(path.dirname(dbPath), { recursive: true });
 
   db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+  db.pragma('busy_timeout = 5000');
   createSchema(db);
 
   // Migrate from JSON files if they exist
@@ -300,8 +400,8 @@ export function createTask(
 ): void {
   db.prepare(
     `
-    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    INSERT INTO scheduled_tasks (id, group_folder, chat_jid, prompt, schedule_type, schedule_value, context_mode, next_run, status, created_at, notion_page_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `,
   ).run(
     task.id,
@@ -314,6 +414,7 @@ export function createTask(
     task.next_run,
     task.status,
     task.created_at,
+    task.notion_page_id ?? null,
   );
 }
 
@@ -617,6 +718,204 @@ export function expireApproval(id: string): void {
   db.prepare(
     `UPDATE approval_requests SET status = 'expired' WHERE id = ? AND status = 'pending'`,
   ).run(id);
+}
+
+// --- Database accessor (for modules needing direct transactional access) ---
+
+export function getDb(): Database.Database {
+  return db;
+}
+
+// --- Notion cache: PARA items ---
+
+export interface ParaCacheRow {
+  page_id: string;
+  name: string;
+  category: string | null;
+  status: string | null;
+  deadline: string | null;
+  parent_para_id: string | null;
+  task_count: number;
+  note_count: number;
+  content_count: number;
+  synced_at: string;
+}
+
+export function upsertParaCache(item: ParaCacheRow): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO notion_para_cache
+     (page_id, name, category, status, deadline, parent_para_id, task_count, note_count, content_count, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    item.page_id, item.name, item.category, item.status, item.deadline,
+    item.parent_para_id, item.task_count, item.note_count, item.content_count, item.synced_at,
+  );
+}
+
+export function getAllParaCache(): ParaCacheRow[] {
+  return db.prepare('SELECT * FROM notion_para_cache ORDER BY name').all() as ParaCacheRow[];
+}
+
+export function getActiveParaCache(): ParaCacheRow[] {
+  return db.prepare("SELECT * FROM notion_para_cache WHERE status = 'Active' ORDER BY name").all() as ParaCacheRow[];
+}
+
+export function clearParaCache(): void {
+  db.prepare('DELETE FROM notion_para_cache').run();
+}
+
+// --- Notion cache: Relations ---
+
+export interface RelationCacheRow {
+  id?: number;
+  source_db: string;
+  source_page_id: string;
+  target_db: string;
+  target_page_id: string;
+  relation_property: string;
+  synced_at: string;
+}
+
+export function insertRelationCache(rel: Omit<RelationCacheRow, 'id'>): void {
+  db.prepare(
+    `INSERT INTO notion_relation_cache
+     (source_db, source_page_id, target_db, target_page_id, relation_property, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(rel.source_db, rel.source_page_id, rel.target_db, rel.target_page_id, rel.relation_property, rel.synced_at);
+}
+
+export function getRelationsForPage(pageId: string): RelationCacheRow[] {
+  return db.prepare(
+    `SELECT * FROM notion_relation_cache
+     WHERE source_page_id = ? OR target_page_id = ?`,
+  ).all(pageId, pageId) as RelationCacheRow[];
+}
+
+export function clearRelationCache(): void {
+  db.prepare('DELETE FROM notion_relation_cache').run();
+}
+
+// --- Notion cache: Daily Pages ---
+
+export interface DailyPageCacheRow {
+  page_id: string;
+  title: string | null;
+  date: string;
+  mood_morning: string | null;
+  mood_evening: string | null;
+  wakefulness_morning: string | null;
+  wakefulness_evening: string | null;
+  concerta_mg: number | null;
+  pregabalin_mg: number | null;
+  caffeine_mg: number | null;
+  creatine_mg: number | null;
+  alcohol_units: number | null;
+  sleepies: number | null;
+  micro_d: number;
+  prayer: number;
+  rosary: number;
+  mass: number;
+  theological_reflections: number;
+  piano: number;
+  b2b: number;
+  ate_healthy: number;
+  workout: string | null;
+  time_asleep: string | null;
+  deep_sleep: string | null;
+  awake: string | null;
+  night_wakings: number | null;
+  lights_out: string | null;
+  sleep_good: number;
+  sleep_bad: number;
+  angry_outburst: number;
+  fionn_woke: number;
+  midnight_snack: number;
+  too_late_to_bed: number;
+  headache: string | null;
+  win: string | null;
+  tasks_done: number;
+  tasks_total: number;
+  synced_at: string;
+}
+
+export function upsertDailyPageCache(page: DailyPageCacheRow): void {
+  db.prepare(
+    `INSERT OR REPLACE INTO notion_daily_pages_cache
+     (page_id, title, date, mood_morning, mood_evening, wakefulness_morning, wakefulness_evening,
+      concerta_mg, pregabalin_mg, caffeine_mg, creatine_mg, alcohol_units, sleepies,
+      micro_d, prayer, rosary, mass, theological_reflections, piano, b2b, ate_healthy,
+      workout, time_asleep, deep_sleep, awake, night_wakings, lights_out,
+      sleep_good, sleep_bad, angry_outburst, fionn_woke, midnight_snack, too_late_to_bed,
+      headache, win, tasks_done, tasks_total, synced_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    page.page_id, page.title, page.date, page.mood_morning, page.mood_evening,
+    page.wakefulness_morning, page.wakefulness_evening,
+    page.concerta_mg, page.pregabalin_mg, page.caffeine_mg, page.creatine_mg,
+    page.alcohol_units, page.sleepies,
+    page.micro_d, page.prayer, page.rosary, page.mass, page.theological_reflections,
+    page.piano, page.b2b, page.ate_healthy,
+    page.workout, page.time_asleep, page.deep_sleep, page.awake, page.night_wakings, page.lights_out,
+    page.sleep_good, page.sleep_bad, page.angry_outburst, page.fionn_woke,
+    page.midnight_snack, page.too_late_to_bed,
+    page.headache, page.win, page.tasks_done, page.tasks_total, page.synced_at,
+  );
+}
+
+export function getDailyPagesCache(sinceDaysAgo?: number): DailyPageCacheRow[] {
+  if (sinceDaysAgo !== undefined) {
+    return db.prepare(
+      `SELECT * FROM notion_daily_pages_cache
+       WHERE date >= date('now', '-' || ? || ' days')
+       ORDER BY date DESC`,
+    ).all(sinceDaysAgo) as DailyPageCacheRow[];
+  }
+  return db.prepare('SELECT * FROM notion_daily_pages_cache ORDER BY date DESC').all() as DailyPageCacheRow[];
+}
+
+export function clearDailyPagesCache(): void {
+  db.prepare('DELETE FROM notion_daily_pages_cache').run();
+}
+
+// --- Notion sync log ---
+
+export interface SyncLogEntry {
+  direction: 'notion_to_local' | 'local_to_notion';
+  operation: 'create' | 'update' | 'delete' | 'sync';
+  notion_db: string;
+  notion_page_id?: string | null;
+  trigger_type: 'message' | 'scheduled_task' | 'webhook' | 'manual_sync';
+  trigger_id?: string | null;
+  group_folder?: string | null;
+  details?: string | null;
+  status?: 'success' | 'error';
+  error_message?: string | null;
+}
+
+export function logNotionSync(entry: SyncLogEntry): void {
+  db.prepare(
+    `INSERT INTO notion_sync_log
+     (direction, operation, notion_db, notion_page_id, trigger_type, trigger_id, group_folder, details, status, error_message, created_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    entry.direction, entry.operation, entry.notion_db, entry.notion_page_id ?? null,
+    entry.trigger_type, entry.trigger_id ?? null, entry.group_folder ?? null,
+    entry.details ?? null, entry.status ?? 'success', entry.error_message ?? null,
+    new Date().toISOString(),
+  );
+}
+
+export function getSyncLog(limit: number = 100): Array<SyncLogEntry & { id: number; created_at: string }> {
+  return db.prepare(
+    'SELECT * FROM notion_sync_log ORDER BY created_at DESC LIMIT ?',
+  ).all(limit) as Array<SyncLogEntry & { id: number; created_at: string }>;
+}
+
+export function pruneSyncLog(daysOld: number): number {
+  const result = db.prepare(
+    `DELETE FROM notion_sync_log WHERE created_at < datetime('now', '-' || ? || ' days')`,
+  ).run(daysOld);
+  return result.changes;
 }
 
 // --- JSON migration ---
