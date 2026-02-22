@@ -19,6 +19,7 @@ import { logger } from './logger.js';
 import { validateAdditionalMounts, verifyMountInode } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 import { getConservativeHardening, getHardeningArgs } from './security/container-hardening.js';
+import { getVncTunnelUrl } from './vnc-tunnel.js';
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -155,6 +156,12 @@ function buildVolumeMounts(
   fs.mkdirSync(path.join(groupIpcDir, 'messages'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'tasks'), { recursive: true });
   fs.mkdirSync(path.join(groupIpcDir, 'input'), { recursive: true });
+  // Write VNC tunnel URL so Raiden can send it to users for browser interaction
+  const vncUrl = getVncTunnelUrl();
+  if (vncUrl) {
+    fs.writeFileSync(path.join(groupIpcDir, 'vnc-url.txt'), vncUrl);
+  }
+
   mounts.push({
     hostPath: groupIpcDir,
     containerPath: '/workspace/ipc',
@@ -170,7 +177,7 @@ function buildVolumeMounts(
     const envContent = fs.readFileSync(envFile, 'utf-8');
     // SECURITY: ANTHROPIC_API_KEY removed from container environment (Phase 2: Credential Isolation)
     // API key is now injected by credential proxy at runtime - agents never see it
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'VNC_PASSWORD'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -225,15 +232,9 @@ function buildVolumeMounts(
 function buildContainerArgs(mounts: VolumeMount[], containerName: string): string[] {
   const args: string[] = ['run', '-i', '--rm', '--name', containerName];
 
-  // Phase 2: Credential Injection
-  // Pass real API key directly to container
-  // TODO: Credential proxy approach doesn't work with Agent SDK - it ignores ANTHROPIC_BASE_URL
-  // Acceptable risk given strong egress filtering, read-only FS, and ephemeral containers
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    throw new Error('ANTHROPIC_API_KEY not set in host environment');
-  }
-  args.push('-e', `ANTHROPIC_API_KEY=${apiKey}`);
+  // Phase 2: Credential Isolation
+  // ANTHROPIC_API_KEY is NOT passed to the container — it's host-only (image OCR, credential proxy).
+  // The container uses CLAUDE_CODE_OAUTH_TOKEN (mounted via /workspace/env-dir/env) for Claude SDK auth.
 
   // Phase 5: Network Egress Filtering
   // Route all other HTTP/HTTPS requests through egress proxy
@@ -242,7 +243,37 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   const egressProxyUrl = `http://${limaGatewayIp}:${process.env.EGRESS_PROXY_PORT || '3002'}`;
   args.push('-e', `HTTP_PROXY=${egressProxyUrl}`);
   args.push('-e', `HTTPS_PROXY=${egressProxyUrl}`);
-  args.push('-e', 'NO_PROXY=localhost,127.0.0.1,api.anthropic.com');
+  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,api.notion.com,${limaGatewayIp}`);
+
+  // Phase 6: Content scanning services accessible from containers
+  args.push('-e', `CLAMAV_HOST=${limaGatewayIp}`);
+  args.push('-e', 'CLAMAV_PORT=3310');
+  args.push('-e', `PROMPT_GUARD_URL=http://${limaGatewayIp}:3003`);
+
+  // Notion MCP integration
+  const notionToken = process.env.NOTION_TOKEN;
+  if (notionToken) {
+    args.push('-e', `NOTION_TOKEN=${notionToken}`);
+  }
+
+  // Anti-detection flags for agent-browser (Chromium)
+  // --disable-blink-features=AutomationControlled: hides navigator.webdriver flag from bot detectors
+  // --no-sandbox: required for Chromium in containers
+  // --no-proxy-server: browser connects directly (egress proxy is for CLI tools, not browser;
+  //   proxying breaks Cloudflare TLS fingerprinting challenge)
+  args.push('-e', 'AGENT_BROWSER_ARGS=--disable-blink-features=AutomationControlled,--no-sandbox,--no-proxy-server,--remote-debugging-port=9222');
+  // Run browser headed (into Xvfb) so CDP screencast works for remote inspection
+  args.push('-e', 'AGENT_BROWSER_HEADED=1');
+
+  // Expose CDP for agent-browser --cdp 9222 (programmatic browser control)
+  // Chromium binds debug port to 127.0.0.1 when --remote-debugging-pipe is also set,
+  // so socat inside the container relays 0.0.0.0:9223 → 127.0.0.1:9222
+  args.push('-p', '127.0.0.1:9222:9223');
+
+  // Expose noVNC for remote browser interaction (Cloudflare challenges, payments, 3D Secure)
+  // Users access via browser on any device — no app install needed
+  // Cloudflare Tunnel makes this accessible from anywhere
+  args.push('-p', '127.0.0.1:6080:6080');
 
   // Phase 3: Container Hardening
   // Apply security restrictions (read-only FS, resource limits, etc.)

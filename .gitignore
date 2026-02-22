@@ -33,6 +33,11 @@ groups/global/*
 *.keys.json
 .env
 
+# Python
+__pycache__/
+*.pyc
+.venv/
+
 # OS
 .DS_Store
 

@@ -207,11 +207,11 @@ export function getConservativeHardening(): HardeningConfig {
     // Skip capabilities (not supported by Apple Container)
     dropCapabilities: [],
 
-    // Resource limits (only --cpus is supported)
+    // Resource limits
     limits: {
-      // Memory limits not verifiable on Apple Container (cgroup v2 or unsupported)
-      // Omitting to avoid errors
-      memory: undefined,
+      // 2GB needed: headed Chromium + Xvfb + Claude agent + agent-browser daemon
+      // 1GB default is too tight — Dunnes search pages time out from memory pressure
+      memory: '2g',
       memorySwap: undefined,
 
       // CPU limits validated working

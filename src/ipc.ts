@@ -13,6 +13,7 @@ import {
 import { AvailableGroup } from './container-runner.js';
 import { createTask, deleteTask, getTaskById, updateTask } from './db.js';
 import { logger } from './logger.js';
+import { OutputMonitor } from './security/output-monitor.js';
 import { RegisteredGroup } from './types.js';
 
 export interface IpcDeps {
@@ -27,6 +28,7 @@ export interface IpcDeps {
     availableGroups: AvailableGroup[],
     registeredJids: Set<string>,
   ) => void;
+  outputMonitor?: OutputMonitor;
 }
 
 let ipcWatcherRunning = false;
@@ -79,6 +81,24 @@ export function startIpcWatcher(deps: IpcDeps): void {
                   isMain ||
                   (targetGroup && targetGroup.folder === sourceGroup)
                 ) {
+                  // Phase 1: Output monitoring — scan before delivery
+                  if (deps.outputMonitor) {
+                    const scan = await deps.outputMonitor.scanOutbound(data.text, {
+                      groupFolder: sourceGroup,
+                      chatJid: data.chatJid,
+                      isMain,
+                      sourceGroup,
+                    });
+                    if (!scan.allowed) {
+                      logger.warn(
+                        { flags: scan.flags, riskLevel: scan.riskLevel, sourceGroup, chatJid: data.chatJid },
+                        'OUTBOUND MESSAGE BLOCKED by output monitor',
+                      );
+                      fs.unlinkSync(filePath);
+                      continue;
+                    }
+                  }
+
                   await deps.sendMessage(
                     data.chatJid,
                     `${ASSISTANT_NAME}: ${data.text}`,

@@ -1,0 +1,61 @@
+# NanoClaw Destructive Command Guard Configuration
+# Protects against prompt injection attacks by blocking destructive commands
+#
+# Philosophy: Secure by default, whitelist as needed
+# - Start with all core protections enabled
+# - Allow specific commands via allowlist (per-group or user-wide)
+# - Different trust levels for main vs non-main groups
+
+[packs]
+# Core security packs (always enabled)
+enabled = [
+    "core.git",           # Protects git reset --hard, git clean -f, etc.
+    "core.filesystem",    # Protects rm -rf outside /tmp
+    "core.shell",         # Protects dangerous shell operations
+    "database.postgresql",
+    "database.mysql",
+    "database.redis",
+    "containers.docker",
+    "containers.kubernetes",
+]
+
+# Disabled packs (can enable for paranoid mode)
+disabled = [
+    # "paranoid.everything"  # Uncomment for maximum protection
+]
+
+[output]
+# Use high contrast for better visibility in logs
+high_contrast = true
+use_color = true
+
+[agents.nanoclaw-main]
+# Main group gets higher trust (your private self-chat)
+trust_level = "high"
+additional_allowlist = [
+    # Add commands you run frequently in main group
+    # Example: "npm run build"
+]
+
+[agents.nanoclaw-group]
+# Non-main groups get low trust (other people)
+trust_level = "low"
+extra_packs = [
+    "paranoid.git",      # Extra git protections
+    "paranoid.filesystem", # Extra filesystem protections
+]
+
+# Project-specific settings
+[projects."/workspace/project"]
+# For main group working on the nanoclaw project itself
+packs = { enabled = ["core.git", "core.filesystem"] }
+
+[projects."/workspace/group"]
+# For all groups (their isolated workspace)
+packs = { enabled = ["core.git", "core.filesystem", "core.shell"] }
+
+[behavior]
+# Fail-open: if dcg errors or times out, allow the command
+# This prevents dcg from breaking legitimate workflow
+fail_open = true
+timeout_ms = 5000

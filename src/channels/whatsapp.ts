@@ -5,12 +5,15 @@ import path from 'path';
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   WASocket,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
 } from '@whiskeysockets/baileys';
 
 import { STORE_DIR } from '../config.js';
+import { isVoiceMessage, transcribeVoiceMessage } from '../transcription.js';
+import { isImageMessage, describeImage } from '../image-ocr.js';
 import {
   getLastGroupSync,
   setLastGroupSync,
@@ -21,6 +24,10 @@ import { Channel, OnInboundMessage, OnChatMetadata, RegisteredGroup } from '../t
 import { RateLimiter, RATE_LIMIT_PRESETS } from '../security/rate-limiter.js';
 import { SenderVerification, DEFAULT_SENDER_CONFIG } from '../security/sender-verification.js';
 import { MediaValidator, DEFAULT_MEDIA_CONFIG } from '../security/media-validator.js';
+import { MalwareScanner } from '../security/malware-scanner.js';
+import { PromptGuard } from '../security/prompt-guard.js';
+import { VirusTotalScanner } from '../security/virustotal.js';
+import { ApprovalGate } from '../security/approval-gate.js';
 
 const GROUP_SYNC_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
 
@@ -70,6 +77,10 @@ export interface WhatsAppChannelOpts {
   onMessage: OnInboundMessage;
   onChatMetadata: OnChatMetadata;
   registeredGroups: () => Record<string, RegisteredGroup>;
+  malwareScanner?: MalwareScanner;
+  promptGuard?: PromptGuard;
+  vtScanner?: VirusTotalScanner;
+  approvalGate?: ApprovalGate;
 }
 
 export class WhatsAppChannel implements Channel {
@@ -90,8 +101,18 @@ export class WhatsAppChannel implements Channel {
   private senderVerification = new SenderVerification(DEFAULT_SENDER_CONFIG);
   private mediaValidator = new MediaValidator(DEFAULT_MEDIA_CONFIG);
 
+  // Phase 6: Content Scanning
+  private malwareScanner?: MalwareScanner;
+  private promptGuard?: PromptGuard;
+  private vtScanner?: VirusTotalScanner;
+  private approvalGate?: ApprovalGate;
+
   constructor(opts: WhatsAppChannelOpts) {
     this.opts = opts;
+    this.malwareScanner = opts.malwareScanner;
+    this.promptGuard = opts.promptGuard;
+    this.vtScanner = opts.vtScanner;
+    this.approvalGate = opts.approvalGate;
   }
 
   async connect(): Promise<void> {
@@ -320,15 +341,113 @@ export class WhatsAppChannel implements Channel {
             }
           }
 
-          const rawContent =
+          // Phase 6: ClamAV Malware Scanning
+          // Scan media file contents after MIME validation passes
+          if (msg.message && (msg.message.imageMessage || msg.message.videoMessage || msg.message.documentMessage || msg.message.audioMessage)) {
+            const mediaMsg = msg.message.imageMessage || msg.message.videoMessage || msg.message.documentMessage || msg.message.audioMessage;
+            if (mediaMsg && this.malwareScanner?.isReady()) {
+              try {
+                const buffer = await downloadMediaMessage(msg, 'buffer', {}, {
+                  logger: logger as any,
+                  reuploadRequest: this.sock.updateMediaMessage,
+                }) as Buffer;
+                const fileName = msg.message.documentMessage?.fileName || 'media';
+                const scan = await this.malwareScanner.scanBuffer(buffer, fileName);
+                if (!scan.clean) {
+                  logger.warn({ sender, chatJid, virus: scan.virus }, 'MALWARE DETECTED — file rejected');
+                  await this.sock.sendMessage(chatJid, { text: 'File rejected: malware detected.' });
+                  continue;
+                }
+              // Phase 4: VirusTotal async background scan (fire-and-forget)
+                if (buffer && this.vtScanner?.isConfigured()) {
+                  const crypto = await import('crypto');
+                  const hash = crypto.createHash('sha256').update(buffer).digest('hex');
+                  this.vtScanner.scanHash(hash, fileName).then((vtResult) => {
+                    if (vtResult.status === 'malicious') {
+                      logger.error(
+                        { hash, fileName, detections: vtResult.malicious, chatJid },
+                        'VIRUSTOTAL: File flagged as malicious (post-delivery)',
+                      );
+                      this.sock.sendMessage(chatJid, {
+                        text: `[SECURITY] A file was flagged by ${vtResult.malicious}/${vtResult.totalEngines} antivirus engines. File: ${fileName}`,
+                      }).catch(() => {}); // Best-effort alert
+                    }
+                  }).catch((err) => {
+                    logger.debug({ err }, 'VirusTotal background scan failed');
+                  });
+                }
+              } catch (err) {
+                logger.error({ err, sender, chatJid }, 'Failed to download media for malware scan');
+                // Fail open — don't block on download errors
+              }
+            }
+          }
+
+          let rawContent =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
             msg.message?.videoMessage?.caption ||
             '';
 
+          // Transcribe voice notes locally (whisper.cpp on host)
+          if (isVoiceMessage(msg)) {
+            try {
+              const transcript = await transcribeVoiceMessage(msg, this.sock);
+              if (transcript) {
+                rawContent = `[Voice: ${transcript}]`;
+                logger.info({ chatJid, length: transcript.length }, 'Voice message transcribed');
+              } else {
+                rawContent = '[Voice message - transcription unavailable]';
+              }
+            } catch (err) {
+              logger.error({ err }, 'Voice transcription error');
+              rawContent = '[Voice message - transcription failed]';
+            }
+          }
+
+          // OCR images (Claude Vision on host)
+          if (isImageMessage(msg)) {
+            try {
+              const description = await describeImage(msg, this.sock);
+              if (description) {
+                rawContent = rawContent
+                  ? `${rawContent}\n[Image: ${description}]`
+                  : `[Image: ${description}]`;
+              } else if (!rawContent) {
+                rawContent = '[Image - OCR unavailable]';
+              }
+            } catch (err) {
+              logger.error({ err }, 'Image OCR error');
+              if (!rawContent) rawContent = '[Image - OCR failed]';
+            }
+          }
+
           // Sanitize message content to prevent prompt injection (Phase 1)
           const content = sanitizeMessageContent(rawContent);
+
+          // Phase 2: Intercept approval gate responses (YES/NO)
+          if (content && this.approvalGate) {
+            const consumed = this.approvalGate.handleResponse(content, sender, chatJid);
+            if (consumed) {
+              // Message was an approval response — don't forward to agent
+              logger.info({ sender, chatJid }, 'Approval response handled');
+              continue;
+            }
+          }
+
+          // Phase 6: ML Prompt Injection Detection
+          // Runs after regex sanitization for defense-in-depth
+          if (content && this.promptGuard?.isReady()) {
+            const classification = await this.promptGuard.classify(content);
+            if (classification.blocked) {
+              logger.warn(
+                { sender, chatJid, label: classification.label, score: classification.score },
+                'PROMPT INJECTION DETECTED — message dropped',
+              );
+              continue; // Silently drop — don't tell attacker what was detected
+            }
+          }
 
           const senderName = msg.pushName || sender.split('@')[0];
 

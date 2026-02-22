@@ -82,6 +82,25 @@ function createSchema(database: Database.Database): void {
   } catch {
     /* column already exists */
   }
+
+  // Phase 2: Approval gate requests table
+  database.exec(`
+    CREATE TABLE IF NOT EXISTS approval_requests (
+      id TEXT PRIMARY KEY,
+      type TEXT NOT NULL,
+      description TEXT NOT NULL,
+      group_folder TEXT NOT NULL,
+      chat_jid TEXT NOT NULL,
+      requested_at TEXT NOT NULL,
+      timeout_ms INTEGER NOT NULL DEFAULT 900000,
+      status TEXT NOT NULL DEFAULT 'pending',
+      responded_by TEXT,
+      responded_at TEXT,
+      context_json TEXT
+    );
+    CREATE INDEX IF NOT EXISTS idx_approval_status ON approval_requests(status);
+    CREATE INDEX IF NOT EXISTS idx_approval_chat ON approval_requests(chat_jid, status);
+  `);
 }
 
 export function initDatabase(): void {
@@ -526,6 +545,78 @@ export function getAllRegisteredGroups(): Record<string, RegisteredGroup> {
     };
   }
   return result;
+}
+
+// --- Approval request accessors (Phase 2: Approval Gate) ---
+
+export interface ApprovalRequestRow {
+  id: string;
+  type: string;
+  description: string;
+  group_folder: string;
+  chat_jid: string;
+  requested_at: string;
+  timeout_ms: number;
+  status: string;
+  responded_by: string | null;
+  responded_at: string | null;
+  context_json: string | null;
+}
+
+export function createApprovalRequest(request: {
+  id: string;
+  type: string;
+  description: string;
+  group_folder: string;
+  chat_jid: string;
+  requested_at: string;
+  timeout_ms: number;
+  status: string;
+  context_json: string;
+}): void {
+  db.prepare(
+    `INSERT INTO approval_requests (id, type, description, group_folder, chat_jid, requested_at, timeout_ms, status, context_json)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    request.id,
+    request.type,
+    request.description,
+    request.group_folder,
+    request.chat_jid,
+    request.requested_at,
+    request.timeout_ms,
+    request.status,
+    request.context_json,
+  );
+}
+
+export function getPendingApprovals(chatJid: string): ApprovalRequestRow[] {
+  return db
+    .prepare(`SELECT * FROM approval_requests WHERE chat_jid = ? AND status = 'pending' ORDER BY requested_at`)
+    .all(chatJid) as ApprovalRequestRow[];
+}
+
+export function resolveApproval(id: string, approved: boolean, respondedBy: string): void {
+  db.prepare(
+    `UPDATE approval_requests SET status = ?, responded_by = ?, responded_at = ? WHERE id = ?`,
+  ).run(approved ? 'approved' : 'denied', respondedBy, new Date().toISOString(), id);
+}
+
+export function getExpiredApprovals(): ApprovalRequestRow[] {
+  // Find pending requests where requested_at + timeout_ms < now
+  return db
+    .prepare(
+      `SELECT * FROM approval_requests
+       WHERE status = 'pending'
+       AND datetime(requested_at, '+' || (timeout_ms / 1000) || ' seconds') < datetime('now')`,
+    )
+    .all() as ApprovalRequestRow[];
+}
+
+export function expireApproval(id: string): void {
+  db.prepare(
+    `UPDATE approval_requests SET status = 'expired' WHERE id = ? AND status = 'pending'`,
+  ).run(id);
 }
 
 // --- JSON migration ---

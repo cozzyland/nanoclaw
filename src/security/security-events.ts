@@ -23,7 +23,12 @@ export type SecurityEventType =
   | 'egress_blocked'
   | 'dlp_violation'
   | 'high_risk_command'
-  | 'message_sanitized';
+  | 'message_sanitized'
+  | 'outbound_blocked'
+  | 'approval_requested'
+  | 'memory_tampering'
+  | 'canary_triggered'
+  | 'malware_detected';
 
 export type SecuritySeverity = 'low' | 'medium' | 'high' | 'critical';
 

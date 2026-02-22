@@ -20,6 +20,7 @@
  */
 
 import express, { Request, Response } from 'express';
+import net from 'net';
 import { createProxyMiddleware, Options as ProxyOptions } from 'http-proxy-middleware';
 import { logger } from '../logger.js';
 
@@ -320,10 +321,13 @@ export class EgressProxy {
 
   /**
    * Start the egress proxy server
+   *
+   * HTTPS CONNECT tunneling is handled at the http.Server level
+   * (Express never sees CONNECT requests — they bypass middleware)
    */
   start(port: number, host = '0.0.0.0'): Promise<void> {
     return new Promise((resolve) => {
-      this.app.listen(port, host, () => {
+      const server = this.app.listen(port, host, () => {
         logger.info(
           {
             port,
@@ -335,6 +339,68 @@ export class EgressProxy {
           'Network egress proxy started (with HTTPS CONNECT support)'
         );
         resolve();
+      });
+
+      // Handle HTTPS CONNECT tunneling at the raw server level
+      server.on('connect', (req: any, clientSocket: net.Socket, head: Buffer) => {
+        const [targetHost, targetPortStr] = (req.url || '').split(':');
+        const targetPort = parseInt(targetPortStr) || 443;
+        const clientId = req.headers['x-client-id'] || 'unknown';
+
+        // Check domain allowlist
+        const allowed = this.config.defaultBlock
+          ? isDomainAllowed(targetHost, this.config.allowedDomains)
+          : true;
+
+        const auditEntry: RequestAuditEntry = {
+          timestamp: new Date().toISOString(),
+          clientId,
+          method: 'CONNECT',
+          host: targetHost,
+          path: req.url,
+          allowed,
+        };
+
+        if (!allowed) {
+          auditEntry.reason = 'Domain not in allowlist';
+          auditLog.push(auditEntry);
+          logger.warn(
+            { host: targetHost, clientId },
+            'BLOCKED: HTTPS CONNECT to unauthorized domain'
+          );
+          clientSocket.write('HTTP/1.1 403 Forbidden\r\n\r\n');
+          clientSocket.destroy();
+          return;
+        }
+
+        // Log allowed request
+        if (this.config.logAllRequests) {
+          auditLog.push(auditEntry);
+          logger.debug({ host: targetHost, port: targetPort, clientId }, 'CONNECT tunnel allowed');
+        }
+
+        // Keep audit log bounded
+        if (auditLog.length > 10000) {
+          auditLog.shift();
+        }
+
+        // Create TCP tunnel to target
+        const targetSocket = net.connect(targetPort, targetHost, () => {
+          clientSocket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+          targetSocket.write(head);
+          targetSocket.pipe(clientSocket);
+          clientSocket.pipe(targetSocket);
+        });
+
+        targetSocket.on('error', (err) => {
+          logger.warn({ host: targetHost, err: err.message }, 'CONNECT tunnel target error');
+          clientSocket.destroy();
+        });
+
+        clientSocket.on('error', (err) => {
+          logger.debug({ host: targetHost, err: err.message }, 'CONNECT tunnel client error');
+          targetSocket.destroy();
+        });
       });
     });
   }
@@ -380,12 +446,23 @@ export const DEFAULT_EGRESS_CONFIG: EgressProxyConfig = {
     'dunnesstoresgrocery.com',
     '*.sts.dunnesstoresgrocery.com',
 
+    // Cloudflare (required for sites behind CF protection)
+    '*.cloudflare.com',
+    '*.cloudflareinsights.com',
+
+    // Common browsing targets (agent-browser needs these)
+    'example.com',
+    '*.gvt1.com',
+
     // Web search & browsing (agent-browser)
     '*.google.com',
     '*.googleapis.com',
     '*.gstatic.com',
     '*.bing.com',
     '*.duckduckgo.com',
+
+    // Notion API (MCP integration)
+    'api.notion.com',
   ],
 
   // Default to blocking (allowlist mode)

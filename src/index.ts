@@ -26,6 +26,7 @@ import {
   getMessagesSince,
   getNewMessages,
   getRouterState,
+  getTaskById,
   initDatabase,
   setRegisteredGroup,
   setRouterState,
@@ -36,11 +37,30 @@ import {
 import { GroupQueue } from './group-queue.js';
 import { startIpcWatcher } from './ipc.js';
 import { formatMessages, formatOutbound } from './router.js';
-import { startSchedulerLoop } from './task-scheduler.js';
+import { runTask, startSchedulerLoop } from './task-scheduler.js';
 import { NewMessage, RegisteredGroup } from './types.js';
 import { logger } from './logger.js';
 import { startCredentialProxy } from './credential-proxy.js';
 import { EgressProxy, DEFAULT_EGRESS_CONFIG } from './security/egress-proxy.js';
+import { MalwareScanner } from './security/malware-scanner.js';
+import { PromptGuard } from './security/prompt-guard.js';
+import { OutputMonitor } from './security/output-monitor.js';
+import { VirusTotalScanner } from './security/virustotal.js';
+import { MemoryIntegrity } from './security/memory-integrity.js';
+import { CanaryDeployer } from './security/canary-tokens.js';
+import {
+  ApprovalGate,
+  ApprovalRequest,
+} from './security/approval-gate.js';
+import {
+  createApprovalRequest,
+  getPendingApprovals,
+  resolveApproval,
+  getExpiredApprovals,
+  expireApproval,
+} from './db.js';
+import { startVncTunnel, stopVncTunnel } from './vnc-tunnel.js';
+import { startWebhookServer } from './webhook-server.js';
 
 // Re-export for backwards compatibility during refactor
 export { escapeXml, formatMessages } from './router.js';
@@ -53,6 +73,7 @@ let messageLoopRunning = false;
 
 let whatsapp: WhatsAppChannel;
 const queue = new GroupQueue();
+let memIntegrity: MemoryIntegrity | null = null;
 
 function loadState(): void {
   lastTimestamp = getRouterState('last_timestamp') || '';
@@ -168,6 +189,11 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     }, IDLE_TIMEOUT);
   };
 
+  // Phase 3: Snapshot memory files before agent session
+  const memSnapshot = memIntegrity
+    ? await memIntegrity.snapshotBefore(group.folder)
+    : null;
+
   await whatsapp.setTyping(chatJid, true);
   let hadError = false;
   let outputSentToUser = false;
@@ -194,6 +220,24 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
 
   await whatsapp.setTyping(chatJid, false);
   if (idleTimer) clearTimeout(idleTimer);
+
+  // Phase 3: Verify memory integrity after agent session
+  if (memIntegrity && memSnapshot) {
+    try {
+      const integrityResult = await memIntegrity.verifyAfter(group.folder, memSnapshot);
+      if (!integrityResult.clean) {
+        for (const change of integrityResult.suspiciousChanges) {
+          if (change.severity === 'high' || change.severity === 'critical') {
+            await whatsapp.sendMessage(chatJid,
+              `[SECURITY] Suspicious memory modification detected and reverted in ${group.name}. ` +
+              `Reason: ${change.reason}`);
+          }
+        }
+      }
+    } catch (err) {
+      logger.error({ err, group: group.name }, 'Memory integrity check failed');
+    }
+  }
 
   if (output === 'error' || hadError) {
     // If we already sent output to the user, don't roll back the cursor —
@@ -480,11 +524,42 @@ async function main(): Promise<void> {
   await egressProxy.start(egressProxyPort, '0.0.0.0');
   logger.info({ port: egressProxyPort }, 'Network egress proxy started');
 
+  // Phase 6: Content Scanning Services
+  // ClamAV malware scanner (connects to clamd TCP 3310)
+  const malwareScanner = new MalwareScanner();
+  await malwareScanner.init();
+
+  // Prompt Guard ML injection detection (connects to FastAPI HTTP 3003)
+  const promptGuard = new PromptGuard();
+  await promptGuard.init();
+
+  // Phase 1: Output monitoring (scans outbound messages)
+  const outputMonitor = new OutputMonitor();
+
+  // Phase 4: VirusTotal background scanning
+  const vtScanner = new VirusTotalScanner();
+  await vtScanner.init();
+
+  // Phase 3: Memory integrity checker
+  const groupsDir = path.join(DATA_DIR, '..', 'groups');
+  memIntegrity = new MemoryIntegrity(groupsDir, DATA_DIR);
+
+  // Phase 5: Canary token deployer
+  const canaryDeployer = new CanaryDeployer(groupsDir);
+
+  // Start VNC tunnel (Cloudflare Quick Tunnel for remote browser access)
+  // URL written to /tmp/nanoclaw-vnc-url.txt for Raiden to read and send to users
+  startVncTunnel().then((url) => {
+    if (url) logger.info({ url }, 'VNC tunnel ready — remote browser access enabled');
+  });
+
   loadState();
 
   // Graceful shutdown handlers
   const shutdown = async (signal: string) => {
     logger.info({ signal }, 'Shutdown signal received');
+    stopVncTunnel();
+    approvalGate?.shutdown();
     await queue.shutdown(10000);
     await whatsapp.disconnect();
     process.exit(0);
@@ -492,37 +567,94 @@ async function main(): Promise<void> {
   process.on('SIGTERM', () => shutdown('SIGTERM'));
   process.on('SIGINT', () => shutdown('SIGINT'));
 
+  // Phase 2: Approval gate (needs sendMessage, so initialized with lazy ref)
+  let approvalGate: ApprovalGate | undefined;
+
   // Create WhatsApp channel
   whatsapp = new WhatsAppChannel({
     onMessage: (chatJid, msg) => storeMessage(msg),
     onChatMetadata: (chatJid, timestamp) => storeChatMetadata(chatJid, timestamp),
     registeredGroups: () => registeredGroups,
+    malwareScanner,
+    promptGuard,
+    vtScanner,
+    approvalGate: undefined, // Set after channel is created
   });
+
+  // Now create approval gate with sendMessage from whatsapp
+  const ownerJid = process.env.NANOCLAW_OWNER_JID || '';
+  if (ownerJid) {
+    approvalGate = new ApprovalGate({
+      sendMessage: (jid, text) => whatsapp.sendMessage(jid, text),
+      ownerJid,
+      createApprovalRequest: (req) => createApprovalRequest(req),
+      getPendingApprovals: (chatJid) => getPendingApprovals(chatJid),
+      resolveApproval: (id, approved, respondedBy) => resolveApproval(id, approved, respondedBy),
+      getExpiredApprovals: () => getExpiredApprovals(),
+      expireApproval: (id) => expireApproval(id),
+    });
+    // Inject into whatsapp channel (it needs to intercept approval responses)
+    (whatsapp as any).approvalGate = approvalGate;
+    logger.info('Approval gate initialized');
+  } else {
+    logger.warn('NANOCLAW_OWNER_JID not set — approval gate disabled');
+  }
 
   // Connect — resolves when first connected
   await whatsapp.connect();
 
   // Start subsystems (independently of connection handler)
-  startSchedulerLoop({
+  const schedulerDeps = {
     registeredGroups: () => registeredGroups,
     getSessions: () => sessions,
     queue,
-    onProcess: (groupJid, proc, containerName, groupFolder) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
-    sendMessage: async (jid, rawText) => {
+    onProcess: (groupJid: string, proc: import('child_process').ChildProcess, containerName: string, groupFolder: string) => queue.registerProcess(groupJid, proc, containerName, groupFolder),
+    sendMessage: async (jid: string, rawText: string) => {
       const text = formatOutbound(whatsapp, rawText);
       if (text) await whatsapp.sendMessage(jid, text);
     },
-  });
+  };
+  startSchedulerLoop(schedulerDeps);
+
+  // Notion webhook server (real-time inbox processing)
+  const webhookSecret = process.env.NOTION_WEBHOOK_SECRET;
+  if (webhookSecret) {
+    const webhookPort = parseInt(process.env.WEBHOOK_PORT || '3004', 10);
+    startWebhookServer(
+      webhookPort,
+      webhookSecret,
+      (chatJid, taskId, fn) => queue.enqueueTask(chatJid, taskId, fn),
+      async (taskId) => {
+        const task = getTaskById(taskId);
+        if (task) await runTask(task, schedulerDeps);
+      },
+    );
+  }
   startIpcWatcher({
     sendMessage: (jid, text) => whatsapp.sendMessage(jid, text),
     registeredGroups: () => registeredGroups,
-    registerGroup,
+    registerGroup: (jid, group) => {
+      registerGroup(jid, group);
+      // Phase 5: Deploy canary tokens for newly registered groups
+      canaryDeployer.deploy(group.folder).catch((err) =>
+        logger.error({ err, folder: group.folder }, 'Failed to deploy canary tokens'),
+      );
+    },
     syncGroupMetadata: (force) => whatsapp.syncGroupMetadata(force),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) => writeGroupsSnapshot(gf, im, ag, rj),
+    outputMonitor,
   });
   queue.setProcessMessagesFn(processGroupMessages);
   recoverPendingMessages();
+
+  // Phase 5: Deploy canary tokens for all existing registered groups
+  for (const group of Object.values(registeredGroups)) {
+    canaryDeployer.deploy(group.folder).catch((err) =>
+      logger.error({ err, folder: group.folder }, 'Failed to deploy canary tokens'),
+    );
+  }
+
   startMessageLoop();
 }
 

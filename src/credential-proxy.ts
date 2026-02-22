@@ -32,8 +32,7 @@ app.use(express.json({ limit: '10mb' }));
 const ANTHROPIC_API_KEY = process.env.ANTHROPIC_API_KEY;
 
 if (!ANTHROPIC_API_KEY) {
-  logger.error('ANTHROPIC_API_KEY not set in environment');
-  process.exit(1);
+  logger.warn('ANTHROPIC_API_KEY not set — credential proxy disabled (using OAuth token instead)');
 }
 
 // Rate limiter: Track API calls per group
@@ -150,7 +149,7 @@ app.post('/v1/messages', async (req: Request, res: Response) => {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
-        'x-api-key': ANTHROPIC_API_KEY, // Injected here - never visible to agent
+        'x-api-key': ANTHROPIC_API_KEY!, // Injected here - never visible to agent
         'anthropic-version': (() => {
           const v = req.headers['anthropic-version'];
           return (Array.isArray(v) ? v[0] : v) || '2023-06-01';
@@ -211,6 +210,10 @@ app.use((req: Request, res: Response) => {
 });
 
 export function startCredentialProxy(port = 3001, host = '0.0.0.0'): Promise<void> {
+  if (!ANTHROPIC_API_KEY) {
+    logger.info('Credential proxy skipped (no ANTHROPIC_API_KEY, using OAuth token)');
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
     app.listen(port, host, () => {
       logger.info({ port, host }, 'Credential proxy server started');

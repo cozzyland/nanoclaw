@@ -1,0 +1,28 @@
+# NanoClaw dcg Allowlist
+# Add commands here that should bypass security checks
+#
+# Usage:
+#   1. Run a command and it gets blocked by dcg
+#   2. If it's safe, add it here with a reason
+#   3. Rebuild container: ./container/build.sh
+#   4. Command will now be allowed
+#
+# Example entries:
+
+# [[allow]]
+# rule = "core.git:reset-hard"
+# reason = "Safe in development workflow - we always have backups"
+# added_at = "2026-02-14T10:00:00Z"
+
+# [[allow]]
+# exact_command = "rm -rf ./dist"
+# reason = "Build directory cleanup - safe to delete"
+# added_at = "2026-02-14T10:00:00Z"
+
+# [[allow]]
+# exact_command = "git clean -fd"
+# reason = "Clean untracked files in development"
+# added_at = "2026-02-14T10:00:00Z"
+# expires_at = "2026-03-14T10:00:00Z"  # Optional: auto-expire after 30 days
+
+# No allowlist entries yet - add them as needed

@@ -20,15 +20,18 @@
     "prebuild": "npm run audit"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.78.0",
     "@types/express": "^5.0.6",
     "@types/http-proxy": "^1.17.17",
     "@types/http-proxy-middleware": "^0.19.3",
     "@whiskeysockets/baileys": "^7.0.0-rc.9",
-    "better-sqlite3": "^11.8.1",
+    "better-sqlite3": "^11.10.0",
+    "clamscan": "^2.4.0",
     "cron-parser": "^5.5.0",
     "express": "^5.2.1",
     "http-proxy": "^1.18.1",
     "http-proxy-middleware": "^3.0.5",
+    "link-preview-js": "^3.2.0",
     "node-fetch": "^2.7.0",
     "pino": "^9.6.0",
     "pino-pretty": "^13.0.0",
@@ -37,7 +40,7 @@
     "zod": "^4.3.6"
   },
   "devDependencies": {
-    "@types/better-sqlite3": "^7.6.12",
+    "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.10.0",
     "@types/node-fetch": "^2.6.13",
     "@types/qrcode-terminal": "^0.12.2",

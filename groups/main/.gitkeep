@@ -2,10 +2,9 @@
 
 # Files tracked in git:
 # - CLAUDE.md (group instructions)
-# - COOKIE_EXPORT_GUIDE.md (user guide)
-# - GROCERY_ORDERING_SETUP.md (quick start)
+# - GROCERY_ORDERING_SETUP.md (Dunnes grocery ordering via CDP)
 
 # Files NOT tracked (in .gitignore):
-# - *-cookies.json (authentication tokens)
+# - .state-*.json (browser state files)
 # - .agent-browser/ (browser profiles)
 # - conversations/ (message history)
