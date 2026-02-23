@@ -1,14 +1,19 @@
 /**
  * VNC Tunnel Manager
  *
- * Starts a Cloudflare Quick Tunnel exposing noVNC (port 6080) to the internet.
- * The tunnel URL is written to a file so Raiden can read and send it to users.
+ * Starts a Cloudflare Named Tunnel exposing noVNC (port 6080) via a fixed
+ * custom domain: https://vnc.cozzyland.net
+ *
+ * The URL is written to a file so Raiden can read and send it to users.
  */
 
 import { spawn, ChildProcess } from 'child_process';
 import fs from 'fs';
+import path from 'path';
 import { logger } from './logger.js';
+import { DATA_DIR } from './config.js';
 
+const TUNNEL_URL = 'https://vnc.cozzyland.net';
 const TUNNEL_URL_FILE = '/tmp/nanoclaw-vnc-url.txt';
 let tunnelProcess: ChildProcess | null = null;
 
@@ -29,7 +34,7 @@ export function startVncTunnel(): Promise<string | null> {
     }
 
     try {
-      tunnelProcess = spawn('cloudflared', ['tunnel', '--url', 'http://localhost:6080'], {
+      tunnelProcess = spawn('cloudflared', ['tunnel', 'run', 'nanoclaw-vnc'], {
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (err) {
@@ -39,17 +44,16 @@ export function startVncTunnel(): Promise<string | null> {
     }
 
     let resolved = false;
-    const urlRegex = /https:\/\/[a-z0-9-]+\.trycloudflare\.com/;
 
+    // Named tunnel uses config.yml — URL is fixed, just wait for "registered" log
     tunnelProcess.stderr?.on('data', (data: Buffer) => {
       const line = data.toString();
-      const match = line.match(urlRegex);
-      if (match && !resolved) {
+      if (!resolved && (line.includes('Registered tunnel connection') || line.includes('INF Connection'))) {
         resolved = true;
-        const url = match[0];
-        fs.writeFileSync(TUNNEL_URL_FILE, url);
-        logger.info({ url }, 'VNC tunnel started');
-        resolve(url);
+        fs.writeFileSync(TUNNEL_URL_FILE, TUNNEL_URL);
+        broadcastVncUrl(TUNNEL_URL);
+        logger.info({ url: TUNNEL_URL }, 'VNC tunnel started');
+        resolve(TUNNEL_URL);
       }
     });
 
@@ -64,7 +68,6 @@ export function startVncTunnel(): Promise<string | null> {
     tunnelProcess.on('exit', (code) => {
       logger.info({ code }, 'VNC tunnel exited');
       tunnelProcess = null;
-      // Clean up URL file so Raiden doesn't send a stale link
       try { fs.unlinkSync(TUNNEL_URL_FILE); } catch {}
     });
 
@@ -72,7 +75,7 @@ export function startVncTunnel(): Promise<string | null> {
     setTimeout(() => {
       if (!resolved) {
         resolved = true;
-        logger.warn('VNC tunnel URL not found after 30s');
+        logger.warn('VNC tunnel connection not established after 30s');
         resolve(null);
       }
     }, 30000);
@@ -85,4 +88,23 @@ export function stopVncTunnel(): void {
     tunnelProcess = null;
   }
   try { fs.unlinkSync(TUNNEL_URL_FILE); } catch {}
+}
+
+/**
+ * Write the VNC URL to all active group IPC dirs so Raiden always has the
+ * current tunnel URL.
+ */
+function broadcastVncUrl(url: string): void {
+  try {
+    const ipcBase = path.join(DATA_DIR, 'ipc');
+    if (!fs.existsSync(ipcBase)) return;
+    for (const group of fs.readdirSync(ipcBase)) {
+      const vncFile = path.join(ipcBase, group, 'vnc-url.txt');
+      try {
+        fs.writeFileSync(vncFile, url);
+      } catch { /* group dir may not be fully set up yet */ }
+    }
+  } catch (err) {
+    logger.debug({ err }, 'Failed to broadcast VNC URL to IPC dirs');
+  }
 }
