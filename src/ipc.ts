@@ -89,10 +89,32 @@ export function startIpcWatcher(deps: IpcDeps): void {
                       isMain,
                       sourceGroup,
                     });
-                    if (!scan.allowed) {
+
+                    // External content flag: if the container ingested external
+                    // content (web/Notion/browser), apply stricter threshold.
+                    // Block medium+ risk when external content was processed.
+                    const externalContentFlagPath = path.join(
+                      ipcBaseDir, sourceGroup, 'external_content_ingested',
+                    );
+                    const hasExternalContent = fs.existsSync(externalContentFlagPath);
+                    const blockedByExternalFlag = hasExternalContent &&
+                      isMain &&
+                      scan.riskLevel !== 'low';
+
+                    if (!scan.allowed || blockedByExternalFlag) {
+                      const reason = blockedByExternalFlag && scan.allowed
+                        ? 'external content flag + elevated risk'
+                        : 'output monitor';
                       logger.warn(
-                        { flags: scan.flags, riskLevel: scan.riskLevel, sourceGroup, chatJid: data.chatJid },
-                        'OUTBOUND MESSAGE BLOCKED by output monitor',
+                        {
+                          flags: scan.flags,
+                          riskLevel: scan.riskLevel,
+                          sourceGroup,
+                          chatJid: data.chatJid,
+                          hasExternalContent,
+                          reason,
+                        },
+                        `OUTBOUND MESSAGE BLOCKED by ${reason}`,
                       );
                       fs.unlinkSync(filePath);
                       continue;

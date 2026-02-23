@@ -77,7 +77,11 @@ export class OutputMonitor {
 
       // Classify risk
       const riskLevel = this.classifyRisk(flags);
-      const allowed = riskLevel !== 'critical';
+      // Main group: block high + critical (more dangerous tools available)
+      // Non-main groups: block critical only (avoid false positives in normal chat)
+      const allowed = context.isMain
+        ? (riskLevel !== 'critical' && riskLevel !== 'high')
+        : (riskLevel !== 'critical');
 
       // Log security events for non-low findings
       if (flags.length > 0) {
@@ -99,6 +103,21 @@ export class OutputMonitor {
 
       return { allowed, flags, riskLevel };
     } catch (err) {
+      if (context.isMain) {
+        // Main group: fail-closed — too dangerous to let scan errors bypass protection
+        logger.error({ err }, 'Output monitor error — FAILING CLOSED (main group)');
+        securityEvents.log({
+          type: 'outbound_blocked',
+          severity: 'critical',
+          source: 'output-monitor',
+          description: 'Output monitor error — failing closed for main group',
+          details: { error: String(err), textLength: text.length },
+          actionTaken: 'Message blocked due to scan error (main group fail-closed)',
+          groupId: context.groupFolder,
+        });
+        return { allowed: false, flags: [], riskLevel: 'critical' };
+      }
+      // Non-main groups: fail-open (existing behavior)
       logger.error({ err }, 'Output monitor error — failing open');
       securityEvents.log({
         type: 'outbound_blocked',

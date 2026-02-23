@@ -18,6 +18,7 @@ import fs from 'fs';
 import path from 'path';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+import { createExternalContentHook, createBashContentHook } from './external-content-hooks.js';
 
 interface ContainerInput {
   prompt: string;
@@ -438,7 +439,13 @@ async function runQuery(
         } : {}),
       },
       hooks: {
-        PreCompact: [{ hooks: [createPreCompactHook()] }]
+        PreCompact: [{ hooks: [createPreCompactHook()] }],
+        PostToolUse: [
+          { matcher: 'WebFetch', hooks: [createExternalContentHook('WebFetch')] },
+          { matcher: 'WebSearch', hooks: [createExternalContentHook('WebSearch')] },
+          { matcher: 'Bash', hooks: [createBashContentHook()] },
+          { matcher: 'mcp__notion__*', hooks: [createExternalContentHook('Notion')] },
+        ],
       },
     }
   });
