@@ -194,6 +194,9 @@ export class MemoryIntegrity {
       // Handle suspicious changes
       for (const change of suspiciousChanges) {
         if (change.severity === 'high' || change.severity === 'critical') {
+          // Save tampered content before any rollback for forensic analysis.
+          this.saveBackup(groupFolder, change.file, before);
+
           // Revert to pre-session snapshot
           const beforeFile = before.files.get(change.file);
           if (beforeFile) {
@@ -204,9 +207,6 @@ export class MemoryIntegrity {
               'Reverted suspicious memory modification',
             );
           }
-
-          // Save backup before revert
-          this.saveBackup(groupFolder, change.file, before);
         }
 
         securityEvents.log({

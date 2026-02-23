@@ -161,8 +161,14 @@ export function sanitizeFileContent(
   }
 
   // Limit length if specified
-  if (options.maxLength && sanitized.length > options.maxLength) {
-    sanitized = sanitized.substring(0, options.maxLength) + '\n\n[Content truncated - exceeded maximum length]';
+  if (typeof options.maxLength === 'number' && sanitized.length > options.maxLength) {
+    const suffix = '\n\n[Content truncated - exceeded maximum length]';
+    if (options.maxLength <= suffix.length) {
+      sanitized = sanitized.substring(0, options.maxLength);
+    } else {
+      const headLength = options.maxLength - suffix.length;
+      sanitized = sanitized.substring(0, headLength) + suffix;
+    }
     findings.push(`Content truncated from ${content.length} to ${options.maxLength} characters`);
     wasModified = true;
     severity = updateSeverity(severity, 'low');

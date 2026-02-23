@@ -44,6 +44,12 @@ export function startWebhookServer(
   enqueueTask: (chatJid: string, taskId: string, fn: () => Promise<void>) => void,
   runTaskFn: (taskId: string) => Promise<void>,
 ): void {
+  if (!MAIN_JID) {
+    throw new Error(
+      'NANOCLAW_OWNER_JID is required to start webhook server (cannot route webhook tasks without owner chat JID)',
+    );
+  }
+
   const app = express();
   app.use(express.json({ limit: '16kb' })); // Webhook payloads are small
 

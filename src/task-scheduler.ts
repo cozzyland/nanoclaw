@@ -183,6 +183,7 @@ export async function runTask(
 }
 
 let schedulerRunning = false;
+const inFlightTaskIds = new Set<string>();
 
 export function startSchedulerLoop(deps: SchedulerDependencies): void {
   if (schedulerRunning) {
@@ -200,30 +201,34 @@ export function startSchedulerLoop(deps: SchedulerDependencies): void {
       }
 
       for (const task of dueTasks) {
+        // Prevent duplicate enqueue while a task is already queued/running.
+        if (inFlightTaskIds.has(task.id)) {
+          continue;
+        }
+
         // Re-check task status in case it was paused/cancelled
         const currentTask = getTaskById(task.id);
         if (!currentTask || currentTask.status !== 'active') {
           continue;
         }
 
-        // Advance next_run BEFORE enqueuing to prevent duplicate runs.
-        // Without this, long-running tasks (e.g. 30-min morning brief) stay
-        // "due" across multiple scheduler polls and get enqueued again.
-        let nextRun: string | null = null;
-        if (currentTask.schedule_type === 'cron') {
-          const interval = CronExpressionParser.parse(currentTask.schedule_value, { tz: TIMEZONE });
-          nextRun = interval.next().toISOString();
-        } else if (currentTask.schedule_type === 'interval') {
-          const ms = parseInt(currentTask.schedule_value, 10);
-          nextRun = new Date(Date.now() + ms).toISOString();
+        inFlightTaskIds.add(currentTask.id);
+        try {
+          deps.queue.enqueueTask(
+            currentTask.chat_jid,
+            currentTask.id,
+            async () => {
+              try {
+                await runTask(currentTask, deps);
+              } finally {
+                inFlightTaskIds.delete(currentTask.id);
+              }
+            },
+          );
+        } catch (err) {
+          inFlightTaskIds.delete(currentTask.id);
+          throw err;
         }
-        updateTaskAfterRun(currentTask.id, nextRun, 'running');
-
-        deps.queue.enqueueTask(
-          currentTask.chat_jid,
-          currentTask.id,
-          () => runTask(currentTask, deps),
-        );
       }
     } catch (err) {
       logger.error({ err }, 'Error in scheduler loop');
