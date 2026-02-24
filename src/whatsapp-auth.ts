@@ -17,6 +17,7 @@ import makeWASocket, {
   DisconnectReason,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
+  fetchLatestWaWebVersion,
 } from '@whiskeysockets/baileys';
 
 const AUTH_DIR = './store/auth';
@@ -53,6 +54,16 @@ async function connectSocket(phoneNumber?: string): Promise<void> {
     process.exit(0);
   }
 
+  // Fetch latest WA web version to avoid 405 rejections from version mismatch
+  let version: [number, number, number] | undefined;
+  try {
+    const { version: v } = await fetchLatestWaWebVersion({});
+    version = v;
+    console.log(`Using WA web version: ${v.join('.')}`);
+  } catch {
+    console.log('Could not fetch latest WA version, using default');
+  }
+
   const sock = makeWASocket({
     auth: {
       creds: state.creds,
@@ -61,6 +72,7 @@ async function connectSocket(phoneNumber?: string): Promise<void> {
     printQRInTerminal: false,
     logger,
     browser: Browsers.macOS('Chrome'),
+    ...(version && { version }),
   });
 
   if (usePairingCode && phoneNumber && !state.creds.me) {

@@ -9,6 +9,7 @@ import makeWASocket, {
   WASocket,
   makeCacheableSignalKeyStore,
   useMultiFileAuthState,
+  fetchLatestWaWebVersion,
 } from '@whiskeysockets/baileys';
 
 import { STORE_DIR } from '../config.js';
@@ -127,6 +128,16 @@ export class WhatsAppChannel implements Channel {
 
     const { state, saveCreds } = await useMultiFileAuthState(authDir);
 
+    // Fetch latest WA web version to avoid 405 rejections from version mismatch
+    let version: [number, number, number] | undefined;
+    try {
+      const { version: v } = await fetchLatestWaWebVersion({});
+      version = v;
+      logger.info({ version }, 'Fetched latest WA web version');
+    } catch (err) {
+      logger.warn({ err }, 'Failed to fetch latest WA version, using default');
+    }
+
     this.sock = makeWASocket({
       auth: {
         creds: state.creds,
@@ -135,6 +146,7 @@ export class WhatsAppChannel implements Channel {
       printQRInTerminal: false,
       logger,
       browser: Browsers.macOS('Chrome'),
+      ...(version && { version }),
     });
 
     this.sock.ev.on('connection.update', (update) => {
