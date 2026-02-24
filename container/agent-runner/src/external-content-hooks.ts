@@ -12,6 +12,7 @@
  */
 
 import fs from 'fs';
+import http from 'http';
 import path from 'path';
 
 // Reuse pattern categories from host's file-sanitizer.ts
@@ -103,37 +104,71 @@ function regexPreScreen(content: string): string[] {
 
 /**
  * Call PromptGuard ML classifier on the host machine.
+ * Uses Node.js http module directly to bypass HTTP_PROXY/HTTPS_PROXY
+ * env vars that Node.js fetch()/undici may honor via global dispatcher.
  * Fails open — returns null if service is unavailable.
  */
-async function callPromptGuard(content: string): Promise<PromptGuardResult | null> {
+function callPromptGuard(content: string): Promise<PromptGuardResult | null> {
   const promptGuardUrl = process.env.PROMPT_GUARD_URL;
   if (!promptGuardUrl) {
     log('PROMPT_GUARD_URL not set, skipping ML classification');
-    return null;
+    return Promise.resolve(null);
   }
 
-  try {
-    // Truncate to avoid sending huge payloads to classifier
-    const text = content.length > 10000 ? content.slice(0, 10000) : content;
+  return new Promise((resolve) => {
+    try {
+      const url = new URL(`${promptGuardUrl}/classify`);
+      const text = content.length > 10000 ? content.slice(0, 10000) : content;
+      const body = JSON.stringify({ text });
 
-    const res = await fetch(`${promptGuardUrl}/classify`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ text }),
-      signal: AbortSignal.timeout(PROMPT_GUARD_TIMEOUT_MS),
-    });
+      const req = http.request(
+        {
+          hostname: url.hostname,
+          port: url.port,
+          path: url.pathname,
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Content-Length': Buffer.byteLength(body),
+          },
+          timeout: PROMPT_GUARD_TIMEOUT_MS,
+        },
+        (res) => {
+          let data = '';
+          res.on('data', (chunk: Buffer) => { data += chunk; });
+          res.on('end', () => {
+            if (res.statusCode !== 200) {
+              log(`PromptGuard classify failed: HTTP ${res.statusCode}`);
+              resolve(null);
+              return;
+            }
+            try {
+              resolve(JSON.parse(data) as PromptGuardResult);
+            } catch {
+              log('PromptGuard returned invalid JSON');
+              resolve(null);
+            }
+          });
+        },
+      );
 
-    if (!res.ok) {
-      log(`PromptGuard classify failed: HTTP ${res.status}`);
-      return null;
+      req.on('error', (err) => {
+        log(`PromptGuard request error: ${err.message}`);
+        resolve(null);
+      });
+      req.on('timeout', () => {
+        log('PromptGuard request timed out');
+        req.destroy();
+        resolve(null);
+      });
+
+      req.write(body);
+      req.end();
+    } catch (err) {
+      log(`PromptGuard call failed: ${err instanceof Error ? err.message : String(err)}`);
+      resolve(null);
     }
-
-    const data = (await res.json()) as PromptGuardResult;
-    return data;
-  } catch (err) {
-    log(`PromptGuard request failed: ${err instanceof Error ? err.message : String(err)}`);
-    return null;
-  }
+  });
 }
 
 /**
