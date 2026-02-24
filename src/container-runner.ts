@@ -177,7 +177,7 @@ function buildVolumeMounts(
     const envContent = fs.readFileSync(envFile, 'utf-8');
     // SECURITY: ANTHROPIC_API_KEY removed from container environment (Phase 2: Credential Isolation)
     // API key is now injected by credential proxy at runtime - agents never see it
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'VNC_PASSWORD'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'VNC_PASSWORD', 'NOTION_TOKEN'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -251,10 +251,10 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   args.push('-e', `PROMPT_GUARD_URL=http://${limaGatewayIp}:3003`);
 
   // Notion MCP integration
-  // NOTION_TOKEN is NOT passed to the container — it stays host-only (notion-sync.ts, webhook-server.ts).
-  // The container accesses Notion data via pre-computed cache snapshots (notion_cache.json, analytics_cache.json)
-  // written to the IPC directory before container spawn. Direct Notion API calls from the container
-  // should use the Notion MCP server which reads the token from the host environment.
+  // NOTION_TOKEN is passed to the container via allowedVars → env file → entrypoint.sh.
+  // The agent-runner conditionally starts the Notion MCP server if NOTION_TOKEN is present.
+  // The container also receives pre-computed cache snapshots (notion_cache.json, analytics_cache.json)
+  // via the IPC directory for fast lookups without API calls.
 
   // Anti-detection flags for agent-browser (Chromium)
   // --disable-blink-features=AutomationControlled: hides navigator.webdriver flag from bot detectors
