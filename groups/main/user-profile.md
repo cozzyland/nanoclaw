@@ -5,7 +5,8 @@ Last updated: 2026-02-23
 ## Identity
 - Name: C (Mark Cosgrave)
 - Location: Wicklow, Ireland
-- Family: Partner Kelly, son Fionn
+- Family: Wife Fi, sons Fionn and Oisin
+- Kelly: Friend (NOT partner)
 - Faith: Practising Catholic
 
 ## Health & Medication
@@ -100,3 +101,4 @@ Last updated: 2026-02-23
 - Appreciates being prompted for daily habits and wins
 - Responds well to gentle accountability, not guilt
 - ADHD-aware: keep task lists manageable, highlight top 3-5 priorities
+- Don't prompt about B2B checkbox — user says it's not important
