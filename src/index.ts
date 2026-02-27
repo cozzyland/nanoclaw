@@ -165,6 +165,15 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
     if (!hasTrigger) return true;
   }
 
+  // Detect @hiku prefix for Haiku model override
+  const HIKU_PATTERN = /^@hiku\b/i;
+  const lastMessage = missedMessages[missedMessages.length - 1];
+  const useHaiku = HIKU_PATTERN.test(lastMessage.content.trim());
+  if (useHaiku) {
+    // Strip the @hiku prefix from the triggering message
+    lastMessage.content = lastMessage.content.trim().replace(HIKU_PATTERN, '').trim();
+  }
+
   const prompt = formatMessages(missedMessages);
 
   // Advance cursor so the piping path in startMessageLoop won't re-fetch
@@ -199,7 +208,8 @@ async function processGroupMessages(chatJid: string): Promise<boolean> {
   let hadError = false;
   let outputSentToUser = false;
 
-  const output = await runAgent(group, prompt, chatJid, async (result) => {
+  const modelOverride = useHaiku ? 'claude-haiku-4-5-20251001' : undefined;
+  const output = await runAgent(group, prompt, chatJid, modelOverride, async (result) => {
     // Streaming output callback — called for each agent result
     if (result.result) {
       const raw = typeof result.result === 'string' ? result.result : JSON.stringify(result.result);
@@ -261,6 +271,7 @@ async function runAgent(
   group: RegisteredGroup,
   prompt: string,
   chatJid: string,
+  model?: string,
   onOutput?: (output: ContainerOutput) => Promise<void>,
 ): Promise<'success' | 'error'> {
   const isMain = group.folder === MAIN_GROUP_FOLDER;
@@ -319,6 +330,7 @@ async function runAgent(
         groupFolder: group.folder,
         chatJid,
         isMain,
+        ...(model && { model }),
         requestId, // For correlating logs across orchestrator → container → proxies
       },
       (proc, containerName) => queue.registerProcess(chatJid, proc, containerName, group.folder),
@@ -409,7 +421,20 @@ async function startMessageLoop(): Promise<void> {
             allPending.length > 0 ? allPending : groupMessages;
           const formatted = formatMessages(messagesToSend);
 
-          if (queue.sendMessage(chatJid, formatted)) {
+          // If @hiku is detected, don't pipe to existing container —
+          // close it so a new Haiku container spawns for this message.
+          const hasHiku = groupMessages.some((m) =>
+            /^@hiku\b/i.test(m.content.trim()),
+          );
+
+          if (hasHiku || !queue.sendMessage(chatJid, formatted)) {
+            if (hasHiku) {
+              logger.info({ chatJid }, '@hiku detected, closing existing container for model switch');
+              queue.closeStdin(chatJid);
+            }
+            // No active container (or forced close) — enqueue for a new one
+            queue.enqueueMessageCheck(chatJid);
+          } else {
             logger.debug(
               { chatJid, count: messagesToSend.length },
               'Piped messages to active container',
@@ -417,9 +442,6 @@ async function startMessageLoop(): Promise<void> {
             lastAgentTimestamp[chatJid] =
               messagesToSend[messagesToSend.length - 1].timestamp;
             saveState();
-          } else {
-            // No active container — enqueue for a new one
-            queue.enqueueMessageCheck(chatJid);
           }
         }
       }
