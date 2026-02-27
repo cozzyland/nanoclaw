@@ -42,6 +42,8 @@ export interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  // Override the default model (e.g. 'claude-haiku-4-5-20251001' for quick responses)
+  model?: string;
   // Request ID for distributed tracing across services
   // Allows correlating logs from orchestrator → container → credential proxy → egress proxy
   requestId?: string;
@@ -243,7 +245,7 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   const egressProxyUrl = `http://${limaGatewayIp}:${process.env.EGRESS_PROXY_PORT || '3002'}`;
   args.push('-e', `HTTP_PROXY=${egressProxyUrl}`);
   args.push('-e', `HTTPS_PROXY=${egressProxyUrl}`);
-  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,${limaGatewayIp}`);
+  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,api.notion.com,${limaGatewayIp}`);
 
   // Phase 6: Content scanning services accessible from containers
   args.push('-e', `CLAMAV_HOST=${limaGatewayIp}`);
