@@ -27,6 +27,7 @@ interface ContainerInput {
   chatJid: string;
   isMain: boolean;
   isScheduledTask?: boolean;
+  model?: string;
 }
 
 interface ContainerOutput {
@@ -414,7 +415,7 @@ async function runQuery(
         'mcp__nanoclaw__*',
         'mcp__notion__*'
       ],
-      model: 'claude-opus-4-6',
+      model: containerInput.model || 'claude-opus-4-6',
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
