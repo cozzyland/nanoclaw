@@ -12,7 +12,7 @@ import makeWASocket, {
   fetchLatestWaWebVersion,
 } from '@whiskeysockets/baileys';
 
-import { STORE_DIR } from '../config.js';
+import { GROUPS_DIR, STORE_DIR } from '../config.js';
 import { isVoiceMessage, transcribeVoiceMessage } from '../transcription.js';
 import { isImageMessage, describeImage } from '../image-ocr.js';
 import {
@@ -355,6 +355,7 @@ export class WhatsAppChannel implements Channel {
 
           // Phase 6: ClamAV Malware Scanning
           // Scan media file contents after MIME validation passes
+          let scannedMediaBuffer: Buffer | null = null;
           if (msg.message && (msg.message.imageMessage || msg.message.videoMessage || msg.message.documentMessage || msg.message.audioMessage)) {
             const mediaMsg = msg.message.imageMessage || msg.message.videoMessage || msg.message.documentMessage || msg.message.audioMessage;
             if (mediaMsg && this.malwareScanner?.isReady()) {
@@ -363,6 +364,7 @@ export class WhatsAppChannel implements Channel {
                   logger: logger as any,
                   reuploadRequest: this.sock.updateMediaMessage,
                 }) as Buffer;
+                scannedMediaBuffer = buffer;
                 const fileName = msg.message.documentMessage?.fileName || 'media';
                 const scan = await this.malwareScanner.scanBuffer(buffer, fileName);
                 if (!scan.clean) {
@@ -395,12 +397,50 @@ export class WhatsAppChannel implements Channel {
             }
           }
 
+          // Save documents/PDFs to group workspace for agent access
+          let savedDocPath: string | null = null;
+          const docMessage = msg.message?.documentMessage
+            || msg.message?.documentWithCaptionMessage?.message?.documentMessage;
+          if (docMessage) {
+            const group = groups[chatJid];
+            if (group) {
+              try {
+                // Reuse buffer from ClamAV scan if available, otherwise download
+                const buffer = scannedMediaBuffer ?? await downloadMediaMessage(msg, 'buffer', {}, {
+                  logger: logger as any,
+                  reuploadRequest: this.sock.updateMediaMessage,
+                }) as Buffer;
+                const receivedDir = path.join(GROUPS_DIR, group.folder, 'received');
+                await fs.promises.mkdir(receivedDir, { recursive: true });
+                const rawName = docMessage.fileName || `document_${Date.now()}`;
+                const fileName = path.basename(rawName) || `document_${Date.now()}`;
+                const filePath = path.join(receivedDir, fileName);
+                if (!filePath.startsWith(receivedDir)) {
+                  logger.warn({ rawName, chatJid }, 'Document rejected: path traversal attempt');
+                } else {
+                  await fs.promises.writeFile(filePath, buffer);
+                  savedDocPath = `/workspace/group/received/${fileName}`;
+                  logger.info({ chatJid, fileName, size: buffer.length }, 'Document saved for agent');
+                }
+              } catch (err) {
+                logger.error({ err, chatJid }, 'Failed to save document for agent');
+              }
+            }
+          }
+
           let rawContent =
             msg.message?.conversation ||
             msg.message?.extendedTextMessage?.text ||
             msg.message?.imageMessage?.caption ||
             msg.message?.videoMessage?.caption ||
+            docMessage?.caption ||
             '';
+
+          // Include document file path in message content
+          if (savedDocPath) {
+            const docInfo = `[Document: ${docMessage?.fileName || 'file'} saved to ${savedDocPath}]`;
+            rawContent = rawContent ? `${rawContent}\n${docInfo}` : docInfo;
+          }
 
           // Transcribe voice notes locally (whisper.cpp on host)
           if (isVoiceMessage(msg)) {
@@ -450,7 +490,9 @@ export class WhatsAppChannel implements Channel {
 
           // Phase 6: ML Prompt Injection Detection
           // Runs after regex sanitization for defense-in-depth
-          if (content && this.promptGuard?.isReady()) {
+          // Skip for own messages — unless forwarded (forwarded content is untrusted)
+          const isForwarded = !!(msg.message?.extendedTextMessage?.contextInfo?.isForwarded);
+          if (content && (!isFromMe || isForwarded) && this.promptGuard?.isReady()) {
             const classification = await this.promptGuard.classify(content);
             if (classification.blocked) {
               logger.warn(

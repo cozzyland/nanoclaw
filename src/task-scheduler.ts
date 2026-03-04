@@ -153,33 +153,47 @@ export async function runTask(
 
   const durationMs = Date.now() - startTime;
 
-  logTaskRun({
-    task_id: task.id,
-    run_at: new Date().toISOString(),
-    duration_ms: durationMs,
-    status: error ? 'error' : 'success',
-    result,
-    error,
-  });
-
-  let nextRun: string | null = null;
-  if (task.schedule_type === 'cron') {
-    const interval = CronExpressionParser.parse(task.schedule_value, {
-      tz: TIMEZONE,
+  try {
+    logTaskRun({
+      task_id: task.id,
+      run_at: new Date().toISOString(),
+      duration_ms: durationMs,
+      status: error ? 'error' : 'success',
+      result,
+      error,
     });
-    nextRun = interval.next().toISOString();
-  } else if (task.schedule_type === 'interval') {
-    const ms = parseInt(task.schedule_value, 10);
-    nextRun = new Date(Date.now() + ms).toISOString();
-  }
-  // 'once' tasks have no next run
 
-  const resultSummary = error
-    ? `Error: ${error}`
-    : result
-      ? result.slice(0, 200)
-      : 'Completed';
-  updateTaskAfterRun(task.id, nextRun, resultSummary);
+    // On error: retry on next scheduler poll (don't advance next_run)
+    // This ensures infrastructure failures (DNS, networking) don't silently skip task runs
+    if (error) {
+      const resultSummary = `Error: ${error}`;
+      // Set next_run to 5 minutes from now (retry delay) instead of advancing to next cron slot
+      const retryDelay = 5 * 60 * 1000;
+      const retryAt = new Date(Date.now() + retryDelay).toISOString();
+      updateTaskAfterRun(task.id, retryAt, resultSummary);
+      logger.warn({ taskId: task.id, retryAt }, 'Task failed, scheduling retry in 5 minutes');
+    } else {
+      let nextRun: string | null = null;
+      if (task.schedule_type === 'cron') {
+        const interval = CronExpressionParser.parse(task.schedule_value, {
+          tz: TIMEZONE,
+        });
+        nextRun = interval.next().toISOString();
+      } else if (task.schedule_type === 'interval') {
+        const ms = parseInt(task.schedule_value, 10);
+        nextRun = new Date(Date.now() + ms).toISOString();
+      }
+      // 'once' tasks have no next run
+
+      const resultSummary = result
+        ? result.slice(0, 200)
+        : 'Completed';
+      updateTaskAfterRun(task.id, nextRun, resultSummary);
+      logger.info({ taskId: task.id, nextRun }, 'Task DB updated');
+    }
+  } catch (dbErr) {
+    logger.error({ taskId: task.id, err: dbErr }, 'Failed to update task in DB after completion');
+  }
 }
 
 let schedulerRunning = false;

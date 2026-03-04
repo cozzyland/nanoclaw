@@ -21,6 +21,205 @@ import { RegisteredGroup } from './types.js';
 import { getConservativeHardening, getHardeningArgs } from './security/container-hardening.js';
 import { getVncTunnelUrl } from './vnc-tunnel.js';
 
+// --- Container Networking Health ---
+// Apple Container VMs can lose network connectivity (stale Lima virtual NIC).
+// When this happens, DNS fails inside containers with EAI_AGAIN/ETIMEOUT/EHOSTUNREACH.
+// We detect these patterns and auto-restart the container system to recover.
+
+const DNS_ERROR_PATTERNS = ['EAI_AGAIN', 'ETIMEOUT', 'EHOSTUNREACH', 'ENETUNREACH', 'Unable to connect to API'];
+let networkRepairInProgress = false;
+
+function isNetworkError(output: string): boolean {
+  return DNS_ERROR_PATTERNS.some((pattern) => output.includes(pattern));
+}
+
+export async function repairContainerNetworking(): Promise<boolean> {
+  if (networkRepairInProgress) {
+    logger.info('Container network repair already in progress, skipping');
+    return false;
+  }
+
+  networkRepairInProgress = true;
+  logger.warn('Detected container networking failure — restarting container system');
+
+  try {
+    await new Promise<void>((resolve, reject) => {
+      exec('container system stop', { timeout: 30000 }, (err) => {
+        if (err) {
+          logger.warn({ err }, 'container system stop returned error (may be expected)');
+        }
+        // Always proceed to start regardless of stop result
+        setTimeout(() => {
+          exec('container system start', { timeout: 30000 }, (err2, stdout2) => {
+            if (err2) {
+              reject(new Error(`container system start failed: ${err2.message}`));
+            } else {
+              resolve();
+            }
+          });
+        }, 2000);
+      });
+    });
+
+    // Verify networking works with a lightweight test
+    const dnsOk = await new Promise<boolean>((resolve) => {
+      exec(
+        `container run --rm --entrypoint node ${CONTAINER_IMAGE} -e "require('dns').resolve4('api.anthropic.com', (e, a) => { process.exit(e ? 1 : 0); })"`,
+        { timeout: 15000 },
+        (err) => resolve(!err),
+      );
+    });
+
+    if (dnsOk) {
+      logger.info('Container networking repaired successfully — DNS resolution working');
+    } else {
+      logger.error('Container networking repair failed — DNS still broken after restart');
+    }
+
+    return dnsOk;
+  } catch (err) {
+    logger.error({ err }, 'Failed to repair container networking');
+    return false;
+  } finally {
+    networkRepairInProgress = false;
+  }
+}
+
+/**
+ * Kill all stale nanoclaw containers from previous sessions.
+ * When NanoClaw restarts, old containers become orphaned — they hang
+ * indefinitely waiting for IPC messages that never come. Over time,
+ * stale vmnet attachments accumulate and corrupt the VM's networking.
+ */
+export async function cleanupStaleContainers(): Promise<void> {
+  try {
+    const { stdout } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+      exec('container list --all --format json 2>/dev/null || container list --all 2>/dev/null', { timeout: 10000 }, (err, stdout, stderr) => {
+        if (err) reject(err);
+        else resolve({ stdout, stderr });
+      });
+    });
+
+    // Parse container list output (text format: columns separated by whitespace)
+    // Look for nanoclaw-* containers and buildkit
+    const lines = stdout.trim().split('\n').filter((l) => l.trim());
+    const staleIds: string[] = [];
+
+    for (const line of lines) {
+      const parts = line.trim().split(/\s+/);
+      const id = parts[0];
+      if (!id || id === 'ID') continue;
+
+      // Kill any nanoclaw container (they're from previous sessions)
+      // Also kill buildkit if stopped (it restarts automatically when needed)
+      if (id.startsWith('nanoclaw-') || (id === 'buildkit' && line.includes('stopped'))) {
+        staleIds.push(id);
+      }
+    }
+
+    if (staleIds.length === 0) {
+      logger.info('No stale containers found');
+      return;
+    }
+
+    logger.warn({ count: staleIds.length, ids: staleIds }, 'Cleaning up stale containers from previous sessions');
+
+    for (const id of staleIds) {
+      try {
+        // Stop first (if running), then remove
+        await new Promise<void>((resolve) => {
+          exec(`container stop ${id} 2>/dev/null; container rm ${id} 2>/dev/null`, { timeout: 15000 }, () => resolve());
+        });
+      } catch {
+        // Ignore individual failures
+      }
+    }
+
+    logger.info({ cleaned: staleIds.length }, 'Stale container cleanup complete');
+  } catch (err) {
+    logger.warn({ err }, 'Failed to clean up stale containers (non-fatal)');
+  }
+}
+
+/**
+ * Periodic reaper: kill containers older than the max timeout.
+ * Runs every 30 minutes to catch any containers that slipped through.
+ */
+let reaperInterval: ReturnType<typeof setInterval> | null = null;
+
+export function startContainerReaper(): void {
+  if (reaperInterval) return;
+
+  const REAPER_INTERVAL_MS = 30 * 60 * 1000; // 30 minutes
+
+  reaperInterval = setInterval(async () => {
+    try {
+      const { stdout } = await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+        exec('container list --all 2>/dev/null', { timeout: 10000 }, (err, stdout, stderr) => {
+          if (err) reject(err);
+          else resolve({ stdout, stderr });
+        });
+      });
+
+      const lines = stdout.trim().split('\n').filter((l) => l.trim());
+      const staleIds: string[] = [];
+
+      for (const line of lines) {
+        const parts = line.trim().split(/\s+/);
+        const id = parts[0];
+        if (!id || id === 'ID' || id === 'buildkit') continue;
+
+        // Extract timestamp from nanoclaw container names (nanoclaw-{group}-{timestamp})
+        if (id.startsWith('nanoclaw-')) {
+          const match = id.match(/(\d{13})$/);
+          if (match) {
+            const createdAt = parseInt(match[1], 10);
+            const ageMs = Date.now() - createdAt;
+            // Kill anything older than 2 hours
+            if (ageMs > 2 * 60 * 60 * 1000) {
+              staleIds.push(id);
+            }
+          }
+        }
+      }
+
+      if (staleIds.length > 0) {
+        logger.warn({ count: staleIds.length, ids: staleIds }, 'Reaper: killing stale containers');
+        for (const id of staleIds) {
+          exec(`container stop ${id} 2>/dev/null; container rm ${id} 2>/dev/null`, { timeout: 15000 }, () => {});
+        }
+      }
+    } catch {
+      // Reaper is best-effort
+    }
+  }, REAPER_INTERVAL_MS);
+}
+
+/**
+ * Verify container networking is healthy on startup.
+ * Runs a lightweight DNS check inside a container and auto-repairs if broken.
+ */
+export async function ensureContainerNetworking(): Promise<void> {
+  const dnsOk = await new Promise<boolean>((resolve) => {
+    exec(
+      `container run --rm --entrypoint node ${CONTAINER_IMAGE} -e "require('dns').resolve4('api.anthropic.com', (e) => { process.exit(e ? 1 : 0); })"`,
+      { timeout: 15000 },
+      (err) => resolve(!err),
+    );
+  });
+
+  if (dnsOk) {
+    logger.info('Container networking health check passed');
+    return;
+  }
+
+  logger.warn('Container networking health check failed — attempting repair');
+  const repaired = await repairContainerNetworking();
+  if (!repaired) {
+    logger.error('Container networking is broken and could not be repaired — containers will fail until fixed');
+  }
+}
+
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
 const OUTPUT_END_MARKER = '---NANOCLAW_OUTPUT_END---';
@@ -179,7 +378,8 @@ function buildVolumeMounts(
     const envContent = fs.readFileSync(envFile, 'utf-8');
     // SECURITY: ANTHROPIC_API_KEY removed from container environment (Phase 2: Credential Isolation)
     // API key is now injected by credential proxy at runtime - agents never see it
-    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'VNC_PASSWORD', 'NOTION_TOKEN'];
+    const allowedVars = ['CLAUDE_CODE_OAUTH_TOKEN', 'VNC_PASSWORD', 'NOTION_TOKEN',
+      'GMAIL_USER', 'GMAIL_PASS', 'ICLOUD_USER', 'ICLOUD_PASS'];
     const filteredLines = envContent.split('\n').filter((line) => {
       const trimmed = line.trim();
       if (!trimmed || trimmed.startsWith('#')) return false;
@@ -245,18 +445,15 @@ function buildContainerArgs(mounts: VolumeMount[], containerName: string): strin
   const egressProxyUrl = `http://${limaGatewayIp}:${process.env.EGRESS_PROXY_PORT || '3002'}`;
   args.push('-e', `HTTP_PROXY=${egressProxyUrl}`);
   args.push('-e', `HTTPS_PROXY=${egressProxyUrl}`);
-  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,api.notion.com,${limaGatewayIp}`);
+  args.push('-e', `NO_PROXY=localhost,127.0.0.1,api.anthropic.com,api.notion.com,imap.gmail.com,imap.mail.me.com,${limaGatewayIp}`);
 
   // Phase 6: Content scanning services accessible from containers
   args.push('-e', `CLAMAV_HOST=${limaGatewayIp}`);
   args.push('-e', 'CLAMAV_PORT=3310');
   args.push('-e', `PROMPT_GUARD_URL=http://${limaGatewayIp}:3003`);
 
-  // Notion MCP integration
-  // NOTION_TOKEN is passed to the container via allowedVars → env file → entrypoint.sh.
-  // The agent-runner conditionally starts the Notion MCP server if NOTION_TOKEN is present.
-  // The container also receives pre-computed cache snapshots (notion_cache.json, analytics_cache.json)
-  // via the IPC directory for fast lookups without API calls.
+  // Notion API: NOTION_TOKEN passed to container for direct REST API access via curl.
+  // api.notion.com is in NO_PROXY so requests bypass the egress proxy.
 
   // Anti-detection flags for agent-browser (Chromium)
   // --disable-blink-features=AutomationControlled: hides navigator.webdriver flag from bot detectors
@@ -521,6 +718,13 @@ export async function runContainerAgent(
               result: null,
               newSessionId,
             });
+          }).catch((err) => {
+            logger.error({ group: group.name, containerName, err }, 'outputChain rejected in idle cleanup path');
+            resolve({
+              status: 'success',
+              result: null,
+              newSessionId,
+            });
           });
           return;
         }
@@ -608,6 +812,15 @@ export async function runContainerAgent(
           'Container exited with error',
         );
 
+        // Auto-repair container networking if DNS/network errors detected
+        const combinedOutput = stderr + stdout;
+        if (isNetworkError(combinedOutput)) {
+          // Fire-and-forget: repair networking so the next retry works
+          repairContainerNetworking().catch((err) => {
+            logger.error({ err }, 'Background network repair failed');
+          });
+        }
+
         resolve({
           status: 'error',
           result: null,
@@ -623,6 +836,13 @@ export async function runContainerAgent(
             { group: group.name, duration, newSessionId },
             'Container completed (streaming mode)',
           );
+          resolve({
+            status: 'success',
+            result: null,
+            newSessionId,
+          });
+        }).catch((err) => {
+          logger.error({ group: group.name, containerName, err }, 'outputChain rejected in streaming close path');
           resolve({
             status: 'success',
             result: null,

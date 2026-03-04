@@ -17,7 +17,8 @@
     "audit": "npm audit --audit-level=high",
     "audit:fix": "npm audit fix",
     "security:check": "npm audit --audit-level=high && npm outdated",
-    "prebuild": "npm run audit"
+    "prebuild": "npm run audit",
+    "postinstall": "test -f node_modules/better-sqlite3/build/Release/better_sqlite3.node || npm rebuild better-sqlite3"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.78.0",

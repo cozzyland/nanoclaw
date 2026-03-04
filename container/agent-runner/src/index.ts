@@ -324,6 +324,59 @@ function waitForIpcMessage(): Promise<string | null> {
   });
 }
 
+interface McpServerConfig {
+  command: string;
+  args: string[];
+  env: Record<string, string>;
+}
+
+/**
+ * Build MCP server configs. Adds email servers only for main group when credentials are available.
+ */
+function buildMcpServers(mcpServerPath: string, containerInput: ContainerInput): Record<string, McpServerConfig> {
+  const servers: Record<string, McpServerConfig> = {
+    nanoclaw: {
+      command: 'node',
+      args: [mcpServerPath],
+      env: {
+        NANOCLAW_CHAT_JID: containerInput.chatJid,
+        NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
+        NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
+      },
+    },
+  };
+
+  const imapMcpPath = path.join(path.dirname(mcpServerPath), 'imap-mcp-stdio.js');
+
+  if (containerInput.isMain && process.env.GMAIL_USER && process.env.GMAIL_PASS) {
+    servers.gmail = {
+      command: 'node',
+      args: [imapMcpPath],
+      env: {
+        IMAP_HOST: 'imap.gmail.com', IMAP_PORT: '993',
+        IMAP_USER: process.env.GMAIL_USER, IMAP_PASS: process.env.GMAIL_PASS,
+        IMAP_LABEL: 'Gmail',
+      },
+    };
+    log('Gmail IMAP MCP server configured');
+  }
+
+  if (containerInput.isMain && process.env.ICLOUD_USER && process.env.ICLOUD_PASS) {
+    servers.icloud = {
+      command: 'node',
+      args: [imapMcpPath],
+      env: {
+        IMAP_HOST: 'imap.mail.me.com', IMAP_PORT: '993',
+        IMAP_USER: process.env.ICLOUD_USER, IMAP_PASS: process.env.ICLOUD_PASS,
+        IMAP_LABEL: 'iCloud',
+      },
+    };
+    log('iCloud IMAP MCP server configured');
+  }
+
+  return servers;
+}
+
 /**
  * Run a single query and stream results via writeOutput.
  * Uses MessageStream (AsyncIterable) to keep isSingleUserTurn=false,
@@ -413,39 +466,22 @@ async function runQuery(
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
         'mcp__nanoclaw__*',
-        'mcp__notion__*'
+        'mcp__gmail__*',
+        'mcp__icloud__*',
       ],
       model: containerInput.model || 'claude-opus-4-6',
       permissionMode: 'bypassPermissions',
       allowDangerouslySkipPermissions: true,
       settingSources: ['project', 'user'],
-      mcpServers: {
-        nanoclaw: {
-          command: 'node',
-          args: [mcpServerPath],
-          env: {
-            NANOCLAW_CHAT_JID: containerInput.chatJid,
-            NANOCLAW_GROUP_FOLDER: containerInput.groupFolder,
-            NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
-          },
-        },
-        ...(process.env.NOTION_TOKEN ? {
-          notion: {
-            command: 'notion-mcp-server',
-            args: [],
-            env: {
-              NOTION_TOKEN: process.env.NOTION_TOKEN,
-            },
-          },
-        } : {}),
-      },
+      mcpServers: buildMcpServers(mcpServerPath, containerInput),
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook()] }],
         PostToolUse: [
           { matcher: 'WebFetch', hooks: [createExternalContentHook('WebFetch')] },
           { matcher: 'WebSearch', hooks: [createExternalContentHook('WebSearch')] },
           { matcher: 'Bash', hooks: [createBashContentHook()] },
-          { matcher: 'mcp__notion__*', hooks: [createExternalContentHook('Notion')] },
+          { matcher: 'mcp__gmail__*', hooks: [createExternalContentHook('Gmail')] },
+          { matcher: 'mcp__icloud__*', hooks: [createExternalContentHook('iCloud')] },
         ],
       },
     }

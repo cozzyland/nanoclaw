@@ -8,7 +8,7 @@ if [ -f /workspace/env-dir/env ]; then
   while IFS='=' read -r key value; do
     case "$key" in
       ''|\#*) continue ;; # Skip empty lines and comments
-      CLAUDE_CODE_OAUTH_TOKEN|VNC_PASSWORD|NOTION_TOKEN|ANTHROPIC_AUTH_TOKEN) export "$key=$value" ;;
+      CLAUDE_CODE_OAUTH_TOKEN|VNC_PASSWORD|NOTION_TOKEN|ANTHROPIC_AUTH_TOKEN|GMAIL_USER|GMAIL_PASS|ICLOUD_USER|ICLOUD_PASS) export "$key=$value" ;;
       *) ;; # Silently ignore unknown vars
     esac
   done < /workspace/env-dir/env

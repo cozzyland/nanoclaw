@@ -14,7 +14,10 @@ import {
 import { WhatsAppChannel } from './channels/whatsapp.js';
 import {
   ContainerOutput,
+  cleanupStaleContainers,
+  ensureContainerNetworking,
   runContainerAgent,
+  startContainerReaper,
   writeGroupsSnapshot,
   writeTasksSnapshot,
 } from './container-runner.js';
@@ -705,6 +708,15 @@ async function main(): Promise<void> {
       logger.error({ err, folder: group.folder }, 'Failed to deploy canary tokens'),
     );
   }
+
+  // Kill stale containers from previous sessions (prevents vmnet corruption)
+  await cleanupStaleContainers();
+
+  // Verify container networking is healthy before processing messages
+  await ensureContainerNetworking();
+
+  // Periodically reap stale containers (every 30 min)
+  startContainerReaper();
 
   startMessageLoop();
 }
